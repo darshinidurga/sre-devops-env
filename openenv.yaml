@@ -1,0 +1,50 @@
+name: sre-devops-env
+version: "1.0.0"
+description: >
+  SRE Cloud DevOps Simulator - An AI agent acts as 
+  an on-call Site Reliability Engineer managing 
+  simulated cloud infrastructure. The agent must 
+  diagnose and fix server outages, traffic spikes, 
+  and memory leaks without taking the site offline.
+author: "Team Darshini"
+tags:
+  - openenv
+  - sre
+  - devops
+  - cloud
+  - infrastructure
+tasks:
+  - id: easy
+    name: "The Dead Server"
+    difficulty: easy
+    max_ticks: 10
+  - id: medium
+    name: "Traffic Tsunami"
+    difficulty: medium
+    max_ticks: 10
+  - id: hard
+    name: "The Silent Killer"
+    difficulty: hard
+    max_ticks: 15
+endpoints:
+  reset: "/reset"
+  step: "/step"
+  state: "/state"
+action_space:
+  - RestartService
+  - ScaleUp
+  - ScaleDown
+  - RollbackDeployment
+  - KillProcess
+  - FlushCache
+  - FailoverDatabase
+  - InvestigateLog
+observation_space:
+  - tick
+  - servers
+  - alerts
+  - logs
+  - deployment_history
+  - active_connections
+  - site_uptime
+  - downtime_ticks
