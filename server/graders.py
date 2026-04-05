@@ -1,277 +1,200 @@
 """
 server/graders.py
 -----------------
-Central grading system for the SRE OpenEnv simulation environment.
-
-Dispatches to the correct per-task ``grade()`` function based on a
-``task_id`` string, normalises scores, and provides both an OO and a
-standalone-function interface so callers (environment.py, inference.py,
-tests) can use whichever style suits them.
-
-Task signatures (for reference)
---------------------------------
-easy   : grade(action_history)                              → float
-medium : grade(action_history, final_state, ticks_survived) → float
-hard   : grade(action_history, final_state, ticks_used)     → float
-
-All task graders already return values in [0.0, 1.0]; ``validate_score``
-performs a defensive clamp + type check as a safety net.
+Central grading system for the SRE DevOps OpenEnv environment.
+Routes grading to the correct task-specific grader.
 """
 
 from __future__ import annotations
 
+import math
 import sys
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
-# ---------------------------------------------------------------------------
-# Path bootstrap — ensure repo root and server/ are importable
-# ---------------------------------------------------------------------------
-_SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.abspath(os.path.join(_SERVER_DIR, ".."))
-for _p in (_REPO_ROOT, _SERVER_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+# ── Path setup ────────────────────────────────────────────────────────────────
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-# ---------------------------------------------------------------------------
-# Import per-task grade functions
-# ---------------------------------------------------------------------------
-from tasks.easy   import grade as _grade_easy    # noqa: E402
-from tasks.medium import grade as _grade_medium  # noqa: E402
-from tasks.hard   import grade as _grade_hard    # noqa: E402
-from models import Action                        # noqa: E402
+_SERVER_DIR = os.path.abspath(os.path.dirname(__file__))
+if _SERVER_DIR not in sys.path:
+    sys.path.insert(0, _SERVER_DIR)
 
-# ---------------------------------------------------------------------------
-# Supported task IDs
-# ---------------------------------------------------------------------------
-SUPPORTED_TASKS = frozenset({"easy", "medium", "hard"})
+# ── Import models ─────────────────────────────────────────────────────────────
+from models import Action, ActionType
 
-
-# ---------------------------------------------------------------------------
-# TaskGrader
-# ---------------------------------------------------------------------------
+# ── Import task graders ───────────────────────────────────────────────────────
+# Using server.tasks.* style as requested
+try:
+    from server.tasks.easy   import grade as easy_grade,   get_task_info as easy_info
+    from server.tasks.medium import grade as medium_grade, get_task_info as medium_info
+    from server.tasks.hard   import grade as hard_grade,   get_task_info as hard_info
+except ImportError:
+    # Fallback for different execution environments
+    from tasks.easy   import grade as easy_grade,   get_task_info as easy_info
+    from tasks.medium import grade as medium_grade, get_task_info as medium_info
+    from tasks.hard   import grade as hard_grade,   get_task_info as hard_info
 
 
+# ── Helper for action normalization ──────────────────────────────────────────
+def _ensure_action_objects(action_history: List[Union[Action, Dict[str, Any]]]) -> List[Action]:
+    """Convert a list of dicts or Actions into a list of Actions."""
+    normalized = []
+    for a in action_history:
+        if isinstance(a, Action):
+            normalized.append(a)
+        elif isinstance(a, dict):
+            # Normalizing dict to Action object so Enum comparisons work
+            normalized.append(Action(
+                action_type=a["action_type"],
+                target_id=a.get("target_id", ""),
+                parameters=a.get("parameters")
+            ))
+        else:
+            raise TypeError(f"Expected Action or dict, got {type(a)}")
+    return normalized
+
+
+# ── TaskGrader Class ──────────────────────────────────────────────────────────
 class TaskGrader:
     """
-    Central dispatcher that routes an episode's data to the appropriate
-    per-task grader and normalises the resulting score.
-
-    Usage
-    -----
-    ::
-
-        grader = TaskGrader()
-
-        # Grade a single episode
-        score = grader.grade_episode(
-            task_id="hard",
-            action_history=actions,
-            final_state=state,
-            ticks_used=7,
-        )
-
-        # Grade all tasks from a results dict
-        scores = grader.get_all_scores({
-            "easy":   {"action_history": [...], "final_state": {...}, "ticks_used": 2},
-            "medium": {"action_history": [...], "final_state": {...}, "ticks_used": 10},
-            "hard":   {"action_history": [...], "final_state": {...}, "ticks_used": 6},
-        })
+    Central grader that routes scoring to the correct task grader.
     """
 
-    # ------------------------------------------------------------------
-    # grade_episode
-    # ------------------------------------------------------------------
+    TASK_IDS = ["easy", "medium", "hard"]
 
     def grade_episode(
+        self,
+        task_id: str,
+        action_history: List[Union[Action, Dict[str, Any]]],
+        final_state: Dict[str, Any],
+        ticks_used: int,
+    ) -> float:
+        """
+        Grade a completed episode for the given task.
+        """
+        # Normalization (fixes 0.0/0.05 score issues when receiving dicts)
+        actions = _ensure_action_objects(action_history)
+
+        # Debug info as requested
+        print(f"Grading {task_id}: {len(actions)} actions")
+        print(f"Actions: {[(a.action_type, a.target_id) for a in actions]}")
+
+        # Routing logic (calls task-specific graders)
+        score = self._route(task_id, actions, final_state, ticks_used)
+        score = self.validate_score(score)
+
+        print(f"Final score: {score}")
+        return score
+
+    def _route(
         self,
         task_id: str,
         action_history: List[Action],
         final_state: Dict[str, Any],
         ticks_used: int,
     ) -> float:
-        """
-        Route the episode to the correct task grader and return a score.
-
-        Parameters
-        ----------
-        task_id:
-            One of ``"easy"``, ``"medium"``, or ``"hard"``.
-        action_history:
-            Ordered list of :class:`~models.Action` objects from the episode.
-        final_state:
-            The state dict at episode end (from ``simulate_tick`` or
-            equivalent).  Ignored for ``easy`` (which only needs actions).
-        ticks_used:
-            Number of ticks consumed during the episode.
-
-        Returns
-        -------
-        float
-            Normalised score in [0.0, 1.0].
-
-        Raises
-        ------
-        ValueError
-            If ``task_id`` is not supported.
-        """
+        """Route to the correct task grader."""
         tid = task_id.strip().lower()
-        if tid not in SUPPORTED_TASKS:
-            raise ValueError(
-                f"Unsupported task_id {task_id!r}. "
-                f"Must be one of: {sorted(SUPPORTED_TASKS)}"
-            )
-
+        
         if tid == "easy":
-            raw = _grade_easy(action_history)
-
+            return easy_grade(action_history=action_history)
         elif tid == "medium":
-            raw = _grade_medium(
-                action_history,
-                final_state,
-                ticks_survived=ticks_used,
+            return medium_grade(
+                action_history=action_history,
+                final_state=final_state,
+                ticks_survived=ticks_used
             )
-
-        else:  # "hard"
-            raw = _grade_hard(
-                action_history,
-                final_state,
-                ticks_used=ticks_used,
+        elif tid == "hard":
+            return hard_grade(
+                action_history=action_history,
+                final_state=final_state,
+                ticks_used=ticks_used
             )
-
-        return self.validate_score(raw)
-
-    # ------------------------------------------------------------------
-    # get_all_scores
-    # ------------------------------------------------------------------
+        else:
+            # Raise ValueError for unknown tasks as requested by validation habits
+            raise ValueError(f"Unknown task_id '{task_id}'")
 
     def get_all_scores(
         self,
         results_dict: Dict[str, Dict[str, Any]],
     ) -> Dict[str, float]:
         """
-        Grade every task present in *results_dict* and return a score map.
-
-        Parameters
-        ----------
-        results_dict:
-            Mapping of ``task_id → episode_data`` where each ``episode_data``
-            is a dict with the following keys:
-
-            ``action_history`` : list[Action]
-                Actions taken during the episode.
-            ``final_state`` : dict
-                Environment state at episode end.
-            ``ticks_used`` : int
-                Ticks consumed (defaults to ``0`` if missing).
-
-        Returns
-        -------
-        dict[str, float]
-            ``{task_id: score}`` for every task_id present in the input.
-
-        Notes
-        -----
-        Tasks present in the input but not in ``SUPPORTED_TASKS`` are
-        silently skipped and will not appear in the output.
+        Grade all tasks from a results dictionary.
         """
-        scores: Dict[str, float] = {}
+        scores = {}
         for task_id, episode_data in results_dict.items():
-            tid = task_id.strip().lower()
-            if tid not in SUPPORTED_TASKS:
-                continue  # skip unknown tasks gracefully
-
-            action_history: List[Action] = episode_data.get("action_history", [])
-            final_state: Dict[str, Any] = episode_data.get("final_state", {})
-            ticks_used: int = int(episode_data.get("ticks_used", 0))
-
-            scores[tid] = self.grade_episode(
-                task_id=tid,
-                action_history=action_history,
-                final_state=final_state,
-                ticks_used=ticks_used,
-            )
-
+            try:
+                scores[task_id] = self.grade_episode(
+                    task_id=task_id,
+                    action_history=episode_data.get("action_history", []),
+                    final_state=episode_data.get("final_state", {}),
+                    ticks_used=episode_data.get("ticks_used", 0),
+                )
+            except ValueError:
+                # Still Return 0.0 for unknown tasks in the bulk grader
+                scores[task_id] = 0.0
         return scores
-
-    # ------------------------------------------------------------------
-    # validate_score
-    # ------------------------------------------------------------------
 
     @staticmethod
     def validate_score(score: float) -> float:
-        """
-        Ensure *score* is a valid float clamped to [0.0, 1.0].
-
-        Parameters
-        ----------
-        score:
-            The raw score returned by a task grader.
-
-        Returns
-        -------
-        float
-            The score clamped to [0.0, 1.0].
-
-        Raises
-        ------
-        TypeError
-            If *score* is not an ``int`` or ``float``.
-        ValueError
-            If *score* is ``NaN`` or ``±Inf``.
-        """
+        """Ensure score is always between 0.0 and 1.0."""
         if not isinstance(score, (int, float)):
-            raise TypeError(
-                f"Score must be a numeric float, got {type(score).__name__!r}: {score!r}"
-            )
-
-        import math
+            raise TypeError(f"Score must be a number, got {type(score)}: {score}")
+        
         if not math.isfinite(score):
-            raise ValueError(
-                f"Score must be a finite number, got {score!r}"
-            )
-
+            return 0.0
+            
         return round(float(min(max(score, 0.0), 1.0)), 4)
 
+    def list_tasks(self):
+        """Return TaskInfo for all tasks."""
+        return [
+            easy_info(),
+            medium_info(),
+            hard_info(),
+        ]
 
-# ---------------------------------------------------------------------------
-# Standalone convenience function (used by inference.py directly)
-# ---------------------------------------------------------------------------
 
-_default_grader = TaskGrader()
-
-
+# ── Standalone function ───────────────────────────────────────────────────────
 def run_grader(
     task_id: str,
-    action_history: List[Action],
+    action_history: List[Union[Action, Dict[str, Any]]],
     final_state: Dict[str, Any],
     ticks_used: int,
 ) -> float:
-    """
-    Standalone function wrapper around :meth:`TaskGrader.grade_episode`.
-
-    Intended for direct use in ``inference.py`` and other scripts that
-    prefer a simple function call over instantiating a class.
-
-    Parameters
-    ----------
-    task_id:
-        One of ``"easy"``, ``"medium"``, or ``"hard"``.
-    action_history:
-        Ordered list of :class:`~models.Action` objects.
-    final_state:
-        Environment state dict at episode end.
-    ticks_used:
-        Number of ticks consumed.
-
-    Returns
-    -------
-    float
-        Score in [0.0, 1.0].
-    """
-    return _default_grader.grade_episode(
+    """Standalone version of TaskGrader.grade_episode()."""
+    grader = TaskGrader()
+    return grader.grade_episode(
         task_id=task_id,
         action_history=action_history,
         final_state=final_state,
-        ticks_used=ticks_used,
+        ticks_used=ticks_used
     )
+
+
+# ── Quick test ────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("Testing graders...\n")
+
+    # Test easy grader with a dict to verify normalization
+    print("=" * 40)
+    print("TEST: Easy — correct first action (dict)")
+    test_actions = [
+        {"action_type": "RestartService", "target_id": "web-3"}
+    ]
+    test_score = run_grader("easy", test_actions, {}, 1)
+    print(f"Expected: 1.0 | Got: {test_score}")
+    assert test_score == 1.0, f"Easy grader failed: {test_score}"
+
+    # Test medium grader
+    print("\n" + "=" * 40)
+    print("TEST: Medium — scale up")
+    med_actions = [
+        {"action_type": "ScaleUp", "target_id": "api-gw-1"}
+    ]
+    test_score = run_grader("medium", med_actions, {}, 10)
+    print(f"Expect score > 0.0 | Got: {test_score}")
+
+    print("\n✅ All grader tests complete!")
