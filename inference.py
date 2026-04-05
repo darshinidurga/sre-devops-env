@@ -1,51 +1,98 @@
 """
 inference.py
-------------
+============
 Baseline inference script for SRE DevOps OpenEnv environment.
-Runs an AI agent against all 3 tasks and reports scores.
 
-Environment Variables:
-    API_BASE_URL : LLM API endpoint
-    MODEL_NAME   : Model identifier  
-    HF_TOKEN     : Hugging Face / API key
+MANDATORY ENVIRONMENT VARIABLES:
+    API_BASE_URL   The API endpoint for the LLM.
+    MODEL_NAME     The model identifier to use for inference.
+    HF_TOKEN       Your Hugging Face / API key.
+
+STDOUT FORMAT:
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 """
 
 import os
 import re
 import json
 import requests
+from typing import List, Optional
 from openai import OpenAI
 
-# ── Configuration ──────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN     = os.getenv("HF_TOKEN",     "")
 ENV_URL      = os.getenv("ENV_URL",      "http://localhost:7860")
+BENCHMARK    = "sre-devops-env"
+MAX_STEPS    = 15
+SUCCESS_SCORE_THRESHOLD = 0.5
 
 client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
-# ── Smart defaults per task ─────────────────────────────────
-TASK_DEFAULTS = {
-    "easy":   {"action_type": "RestartService",     "target_id": "web-3"},
-    "medium": {"action_type": "ScaleUp",            "target_id": "api-gw-1"},
-    "hard":   {"action_type": "InvestigateLog",     "target_id": "web-1"},
-}
-
+# ── Valid actions & smart defaults ─────────────────────────────────────────────
 VALID_ACTIONS = [
     "RestartService", "ScaleUp", "ScaleDown",
     "RollbackDeployment", "KillProcess",
     "FlushCache", "FailoverDatabase", "InvestigateLog"
 ]
 
-# ── AI Action ───────────────────────────────────────────────
-def get_ai_action(observation: dict, task_id: str, 
-                  action_log: list = None) -> dict:
+TASK_DEFAULTS = {
+    "easy":   {"action_type": "RestartService",     "target_id": "web-3"},
+    "medium": {"action_type": "ScaleUp",            "target_id": "api-gw-1"},
+    "hard":   {"action_type": "InvestigateLog",     "target_id": "web-1"},
+}
+
+# ── Mandatory log functions ────────────────────────────────────────────────────
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(
+    step: int,
+    action: str,
+    reward: float,
+    done: bool,
+    error: Optional[str]
+) -> None:
+    error_val = error if error else "null"
+    done_val  = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} "
+        f"reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(
+    success: bool,
+    steps: int,
+    score: float,
+    rewards: List[float]
+) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} "
+        f"steps={steps} score={score:.2f} rewards={rewards_str}",
+        flush=True,
+    )
+
+
+# ── AI Action ──────────────────────────────────────────────────────────────────
+def get_ai_action(
+    observation: dict,
+    task_id: str,
+    action_log: List[dict] = None
+) -> dict:
     if action_log is None:
         action_log = []
 
     servers = observation.get("servers", {})
     server_summary = "\n".join([
-        f"  {sid}: cpu={s['cpu']}% ram={s['ram']}% status={s['status']}"
+        f"  {sid}: cpu={s['cpu']}% ram={s['ram']}% "
+        f"status={s['status']}"
         for sid, s in servers.items()
     ])
 
@@ -59,6 +106,12 @@ def get_ai_action(observation: dict, task_id: str,
     log_summary = "\n".join([
         f"  {l['server']}: {l['message']}"
         for l in logs
+    ]) or "  None"
+
+    deployments = observation.get("deployment_history", [])
+    deploy_summary = "\n".join([
+        f"  {d['version']} — {d['status']}"
+        for d in deployments
     ]) or "  None"
 
     recent = action_log[-3:] if action_log else []
@@ -84,10 +137,9 @@ RECENT LOGS:
 {log_summary}
 
 DEPLOYMENT HISTORY:
-{json.dumps([d['version'] + ' (' + d['status'] + ')'
-for d in observation.get('deployment_history', [])], indent=2)}
+{deploy_summary}
 
-ACTIONS ALREADY TAKEN - DO NOT REPEAT THESE:
+ACTIONS ALREADY TAKEN - DO NOT REPEAT:
 {recent_summary}
 
 STRICT RULES:
@@ -137,116 +189,143 @@ Respond with ONLY a JSON object:
     return TASK_DEFAULTS[task_id]
 
 
-# ── Run Task ────────────────────────────────────────────────
+# ── Run Single Task ────────────────────────────────────────────────────────────
 def run_task(task_id: str) -> float:
-    print(f"\n{'='*50}")
-    print(f"Running Task: {task_id.upper()}")
-    print(f"{'='*50}")
+
+    rewards:    List[float] = []
+    action_log: List[dict]  = []
+    steps_taken = 0
+    score       = 0.0
+    success     = False
+
+    # Mandatory START log
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
+        # Reset environment
         response = requests.post(
             f"{ENV_URL}/reset/{task_id}",
             timeout=10
         )
         obs = response.json()
-    except Exception as e:
-        print(f"ERROR resetting task: {e}")
-        return 0.0
 
-    print(f"Task: {obs.get('task_description', '')[:100]}")
+        done = False
 
-    final_score = 0.0
-    best_score  = 0.0
-    done        = False
-    tick        = 0
-    action_log  = []
+        for step in range(1, MAX_STEPS + 1):
+            if done:
+                break
 
-    while not done and tick < 15:
-        tick += 1
+            steps_taken = step
+            error_msg   = None
 
-        try:
-            action = get_ai_action(obs, task_id, action_log)
-        except Exception as e:
-            print(f"Tick {tick:>2}: AI error — {str(e)[:60]}")
-            action = TASK_DEFAULTS[task_id]
+            # Get AI action
+            try:
+                action = get_ai_action(obs, task_id, action_log)
+            except Exception as e:
+                error_msg = str(e)[:80]
+                action    = TASK_DEFAULTS[task_id]
 
-        if not action.get("target_id"):
-            action["target_id"] = "v2.3.0" \
-                if action.get("action_type") == "RollbackDeployment" \
-                else "web-1"
+            # Fix null target
+            if not action.get("target_id"):
+                action["target_id"] = "v2.3.0" \
+                    if action.get("action_type") == "RollbackDeployment" \
+                    else "web-1"
 
-        action_log.append(action)
+            action_log.append(action)
+            action_str = f"{action['action_type']}({action['target_id']})"
 
-        print(f"Tick {tick:>2}: {action['action_type']:<22} "
-              f"→ {action['target_id']}")
+            # Send to environment
+            reward = 0.0
+            try:
+                step_resp = requests.post(
+                    f"{ENV_URL}/step",
+                    json={
+                        "action_type": action["action_type"],
+                        "target_id":   action["target_id"],
+                        "parameters":  {}
+                    },
+                    timeout=10
+                )
+                result     = step_resp.json()
+                obs        = result.get("observation", obs)
+                reward_obj = result.get("reward", {})
+                done       = result.get("done", False)
+                reward     = reward_obj.get("score", 0.0)
+                score      = reward
 
-        try:
-            step_resp = requests.post(
-                f"{ENV_URL}/step",
-                json={
-                    "action_type": action["action_type"],
-                    "target_id":   action["target_id"],
-                    "parameters":  {}
-                },
-                timeout=10
+            except Exception as e:
+                error_msg = str(e)[:80]
+                done      = True
+
+            rewards.append(reward)
+
+            # Mandatory STEP log
+            log_step(
+                step=step,
+                action=action_str,
+                reward=reward,
+                done=done,
+                error=error_msg,
             )
-            result      = step_resp.json()
-            obs         = result.get("observation", obs)
-            reward_obj  = result.get("reward", {})
-            done        = result.get("done", False)
-            score       = reward_obj.get("score", 0.0)
-            feedback    = reward_obj.get("feedback", "")
-            final_score = score
-            best_score  = max(best_score, score)
 
-            print(f"         Score: {score:.2f} | "
-                  f"Best: {best_score:.2f} | "
-                  f"Done: {done}")
-            if feedback:
-                print(f"         → {feedback[:70]}")
+        success = score >= SUCCESS_SCORE_THRESHOLD
 
-        except Exception as e:
-            print(f"         Step error: {e}")
-            break
+    except Exception as e:
+        log_step(
+            step=steps_taken + 1,
+            action="error",
+            reward=0.0,
+            done=True,
+            error=str(e)[:80],
+        )
 
-    print(f"\n  → Final Score [{task_id}]: {final_score:.4f}")
-    print(f"  → Best Score  [{task_id}]: {best_score:.4f}")
-    return final_score
+    finally:
+        # Mandatory END log
+        log_end(
+            success=success,
+            steps=steps_taken,
+            score=score,
+            rewards=rewards,
+        )
 
-# ── Main ────────────────────────────────────────────────────
-def main():
-    print("\n" + "="*50)
-    print("SRE DEVOPS ENV — BASELINE INFERENCE")
-    print("="*50)
-    print(f"API : {API_BASE_URL}")
-    print(f"Model: {MODEL_NAME}")
-    print(f"Env  : {ENV_URL}")
+    return score
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main() -> None:
+    print("=" * 50, flush=True)
+    print("SRE DEVOPS ENV — BASELINE INFERENCE", flush=True)
+    print("=" * 50, flush=True)
+    print(f"API  : {API_BASE_URL}", flush=True)
+    print(f"Model: {MODEL_NAME}", flush=True)
+    print(f"Env  : {ENV_URL}", flush=True)
 
     # Health check
     try:
         r = requests.get(f"{ENV_URL}/health", timeout=5)
-        print(f"Health: {r.json()}")
+        print(f"Health: {r.json()}", flush=True)
     except Exception:
-        print("ERROR: Environment not running!")
-        print("Fix: uvicorn app:app --host 0.0.0.0 --port 7860")
+        print("ERROR: Environment not running!", flush=True)
+        print(f"Fix: uvicorn app:app --host 0.0.0.0 --port 7860", flush=True)
         return
 
     # Run all 3 tasks
     scores = {}
     for task_id in ["easy", "medium", "hard"]:
+        print(f"\n{'='*50}", flush=True)
         scores[task_id] = run_task(task_id)
 
-    # Results
-    print("\n" + "="*50)
-    print("BASELINE RESULTS")
-    print("="*50)
+    # Final summary
+    print(f"\n{'='*50}", flush=True)
+    print("BASELINE RESULTS", flush=True)
+    print("=" * 50, flush=True)
     for task_id, score in scores.items():
         bar = "█" * int(score * 20)
-        print(f"  {task_id:<8} | {score:.4f} | {bar}")
+        print(f"  {task_id:<8} | {score:.4f} | {bar}", flush=True)
     avg = sum(scores.values()) / len(scores)
-    print(f"\n  Average  | {avg:.4f}")
-    print("="*50)
-    print("Baseline inference complete ✅")
+    print(f"\n  Average  | {avg:.4f}", flush=True)
+    print("=" * 50, flush=True)
+    print("Baseline inference complete ✅", flush=True)
 
 
 if __name__ == "__main__":
