@@ -177,22 +177,32 @@ def setup_scenario() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def grade(action_history: List[Action]) -> float:
+def grade(
+    action_history: List[Action],
+    final_state: dict = None,  # accepted but unused for easy task
+    ticks_used: int = 0,       # accepted but unused for easy task
+) -> float:
     """
     Score the agent's performance based on its action history.
 
     Scoring rubric
     --------------
-    1.0  — The very first action was RestartService targeting web-3
-    0.7  — RestartService on web-3 was performed, but InvestigateLog came first
-    0.5  — RestartService on web-3 was performed, but a wrong server was tried first
-    0.3  — RestartService on web-3 was eventually performed after ≥5 wrong actions
+    1.0  — RestartService on web-3 was the VERY FIRST action
+    0.7  — RestartService on web-3 was performed, but not as first action
+           (agent did some investigation/other actions before finding the issue)
+    0.5  — RestartService on web-3 was performed after 5 or more other actions
+           (agent took too long to find the root cause)
+    0.3  — Agent tried restarting a wrong server before eventually fixing web-3
     0.0  — web-3 was never restarted
 
     Parameters
     ----------
     action_history:
         Ordered list of Action objects taken during the episode (earliest first).
+    final_state:
+        Ignored for this task (accepted for API consistency with medium/hard).
+    ticks_used:
+        Ignored for this task (accepted for API consistency with medium/hard).
 
     Returns
     -------
@@ -202,13 +212,23 @@ def grade(action_history: List[Action]) -> float:
     if not action_history:
         return 0.0
 
+    def _is_restart_web3(action: Action) -> bool:
+        """Return True regardless of whether action_type is stored as enum or str."""
+        atype = action.action_type
+        # Normalise: could be ActionType enum member OR plain string
+        atype_str = atype.value if hasattr(atype, "value") else str(atype)
+        return atype_str == "RestartService" and action.target_id == "web-3"
+
+    def _is_action_type(action: Action, type_str: str) -> bool:
+        """Generic helper to compare action_type against a string name."""
+        atype = action.action_type
+        atype_str = atype.value if hasattr(atype, "value") else str(atype)
+        return atype_str == type_str
+
     # Find the index of the first RestartService targeting web-3
     restart_web3_idx: int | None = None
     for idx, action in enumerate(action_history):
-        if (
-            action.action_type == ActionType.RestartService
-            and action.target_id == "web-3"
-        ):
+        if _is_restart_web3(action):
             restart_web3_idx = idx
             break
 
@@ -223,28 +243,21 @@ def grade(action_history: List[Action]) -> float:
     # Inspect actions taken before the correct restart
     prior_actions = action_history[:restart_web3_idx]
 
-    investigated_log_first = any(
-        a.action_type == ActionType.InvestigateLog for a in prior_actions
-    )
     tried_wrong_server = any(
-        a.action_type == ActionType.RestartService and a.target_id != "web-3"
+        _is_action_type(a, "RestartService") and a.target_id != "web-3"
         for a in prior_actions
     )
 
-    # Many wrong actions before getting it right
-    if len(prior_actions) >= 5:
+    # Worst case: tried wrong server before eventually fixing web-3
+    if tried_wrong_server:
         return 0.3
 
-    # Tried restarting a wrong server before web-3
-    if tried_wrong_server:
+    # Slow case: 5 or more actions taken before finding the right fix
+    if len(prior_actions) >= 5:
         return 0.5
 
-    # Only investigated logs before taking the right action
-    if investigated_log_first:
-        return 0.7
-
-    # Fallback: some other non-restart preamble actions
-    return 0.5
+    # Not first, but found it reasonably quickly without wrong restarts
+    return 0.7
 
 
 # ---------------------------------------------------------------------------

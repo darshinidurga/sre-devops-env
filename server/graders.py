@@ -123,7 +123,7 @@ class TaskGrader:
             )
 
         if tid == "easy":
-            raw = _grade_easy(action_history)
+            raw = _grade_easy(action_history, final_state, ticks_used)
 
         elif tid == "medium":
             raw = _grade_medium(

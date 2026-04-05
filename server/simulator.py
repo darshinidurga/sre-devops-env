@@ -781,8 +781,9 @@ class TechCorpSimulator:
     # ------------------------------------------------------------------
 
     @property
-    def tick(self) -> int:
-        """Current simulation tick (read-only)."""
+    def current_tick(self) -> int:
+        """Current simulation tick (read-only). Renamed from ``tick`` to avoid
+        shadowing the ``tick()`` advance method."""
         return self._tick
 
     @property

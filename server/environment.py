@@ -49,6 +49,9 @@ from models import (  # noqa: E402
     TaskInfo,
 )
 from simulator import TechCorpSimulator  # noqa: E402
+from graders import TaskGrader            # noqa: E402
+
+_grader = TaskGrader()
 
 # Task modules (loaded lazily in reset())
 import server.tasks.easy   as _task_easy    # noqa: E402
@@ -154,8 +157,10 @@ class SREEnvironment:
 
         # Reward-shaping state
         self._prev_alerts: List[Alert]          = []
-        self._action_history: Deque[str]        = deque(maxlen=10)  # last 10 action types
-        self._action_repeat_window: Deque[str]  = deque(maxlen=3)   # last 3 full action keys
+        # Full ordered list of Action objects — passed to the task grader every step
+        self._action_full_history: List[Action] = []
+        # Deque kept only for the per-step repeat-penalty heuristic
+        self._action_repeat_window: Deque[str]  = deque(maxlen=3)
 
     # ------------------------------------------------------------------
     # Public API
@@ -202,11 +207,11 @@ class SREEnvironment:
         self._downtime_ticks   = 0
         self._consecutive_up   = 0
         self._done             = False
-        self._prev_alerts      = []
+        self._prev_alerts           = []
 
-        # Reset action history to empty list/deque
-        self._action_history       = deque(maxlen=10)
-        self._action_repeat_window = deque(maxlen=3)
+        # Reset action history — full list for grader, window for repeat detection
+        self._action_full_history   = []
+        self._action_repeat_window  = deque(maxlen=3)
 
         # Apply scenario-specific starting conditions
         self._apply_scenario_preset(task_id)
@@ -270,25 +275,25 @@ class SREEnvironment:
         # Update alert cache for next step's diff
         self._prev_alerts = new_alerts
 
-        # Update action history for repeat-penalty detection
+        # --- record action (full list for grader, window for repeat check) -
+        self._action_full_history.append(action)
         action_key = f"{action.action_type}::{action.target_id}"
-        self._action_history.append(action.action_type)
         self._action_repeat_window.append(action_key)
 
         # --- check done ---------------------------------------------------
         done, done_reason = self._check_done(site_up)
         self._done = done
 
-        # --- calculate reward --------------------------------------------
+        # --- calculate reward via task grader ----------------------------
         reward = self._calculate_reward(
-            action      = action,
-            prev_state  = prev_state,
-            new_state   = new_state,
-            prev_alerts = prev_alerts,
-            new_alerts  = new_alerts,
-            prev_site_up= prev_site_up,
-            site_up     = site_up,
-            done        = done,
+            action       = action,
+            prev_state   = prev_state,
+            new_state    = new_state,
+            prev_alerts  = prev_alerts,
+            new_alerts   = new_alerts,
+            prev_site_up = prev_site_up,
+            site_up      = site_up,
+            done         = done,
         )
 
         # --- build observation -------------------------------------------
@@ -304,6 +309,7 @@ class SREEnvironment:
                 "episode_tick"  : self._episode_tick,
                 "downtime_ticks": self._downtime_ticks,
                 "consecutive_up": self._consecutive_up,
+                "actions_taken" : len(self._action_full_history),
             },
         )
 
@@ -340,171 +346,135 @@ class SREEnvironment:
         done: bool,
     ) -> Reward:
         """
-        Compute the scalar reward for a single step.
+        Compute the step reward.
 
-        Scoring components
-        ------------------
-        Positive:
-          +0.20  Action resolved ≥1 critical alert that existed before the step
-          +0.15  Cluster is measurably more stable (fewer servers in bad status)
-          +0.10  Action targeted an actually-problematic server
+        Score source
+        ------------
+        The primary score comes from ``TaskGrader.grade_episode()`` which
+        calls the per-task grader (easy/medium/hard) on the *full* action
+        history accumulated so far.  This ensures the score reflects
+        cumulative correctness not just last-step heuristics.
 
-        Negative:
-          -0.15  Restarted a server that was already healthy
-          -0.20  Same action+target repeated ≥3 times consecutively
-          -0.50  Site went completely down this step
-          -0.10  ScaleUp issued while average CPU across the role was already low
+        Step-level adjustments (applied on top, then clamped)
+        -------------------------------------------------------
+        -0.50  Site went completely down this step
+        -0.20  Same action+target repeated ≥3 times in last 3 steps
+        -0.10  ScaleUp on a role whose average CPU was already below 40 %
 
-        Baseline:
-          +0.05  Awarded every step the site is up (encourages uptime maintenance)
-
-        The raw sum is clamped to [0.0, 1.0].
-
-        Returns
-        -------
-        Reward
+        Feedback string summarises every action taken so far (narrated),
+        plus any step-level penalty that fired.
         """
-        score     = 0.0
-        breakdown: Dict[str, float] = {}
-        reasons:   List[str]        = []
+        assert self._task is not None
 
-        atype  = ActionType(action.action_type)
-        target = action.target_id
+        task_id = self._task.task_id
+        target  = action.target_id
+        atype   = ActionType(action.action_type)
 
-        prev_servers: Dict[str, Server] = prev_state["servers"]
-        new_servers:  Dict[str, Server] = new_state["servers"]
-
-        # ── baseline: uptime reward ──────────────────────────────────────
-        if site_up:
-            breakdown["uptime_bonus"] = 0.05
-            score += 0.05
-            reasons.append("Site is up (+0.05)")
-
-        # ── positive: resolved critical alert ───────────────────────────
-        prev_crit_servers = {
-            a.server for a in prev_alerts
-            if a.severity == AlertSeverity.critical
-        }
-        new_crit_servers = {
-            a.server for a in new_alerts
-            if a.severity == AlertSeverity.critical
-        }
-        resolved_crits = prev_crit_servers - new_crit_servers
-
-        if resolved_crits:
-            breakdown["resolved_critical"] = 0.20
-            score += 0.20
-            reasons.append(
-                f"Resolved critical alert(s) on {resolved_crits} (+0.20)"
+        # ── 1. Task-grader score (cumulative over full action history) ────
+        try:
+            grader_score = _grader.grade_episode(
+                task_id        = task_id,
+                action_history = self._action_full_history,
+                final_state    = new_state,
+                ticks_used     = self._episode_tick,
             )
+        except Exception:
+            grader_score = 0.0
 
-        # ── positive: cluster more stable ────────────────────────────────
-        def _bad_count(servers: Dict[str, Server]) -> int:
-            """Count servers not in 'healthy' status."""
-            return sum(
-                1 for s in servers.values()
-                if s.status not in (ServerStatus.healthy, "healthy")
-            )
+        score     = grader_score
+        breakdown: Dict[str, float] = {"grader_score": round(grader_score, 4)}
+        penalties: List[str]        = []
 
-        prev_bad = _bad_count(prev_servers)
-        new_bad  = _bad_count(new_servers)
+        # ── 2. Step-level penalties (score only, never end episode) ───────
 
-        if new_bad < prev_bad:
-            breakdown["stability_gain"] = 0.15
-            score += 0.15
-            reasons.append(
-                f"Cluster more stable: bad server count {prev_bad}→{new_bad} (+0.15)"
-            )
-
-        # ── positive: action targeted a problematic server ───────────────
-        target_srv = prev_servers.get(target)
-        target_was_bad = (
-            target_srv is not None
-            and target_srv.status not in (ServerStatus.healthy, "healthy")
-        )
-        if target_was_bad:
-            breakdown["targeted_problem"] = 0.10
-            score += 0.10
-            reasons.append(
-                f"Action targeted a non-healthy server '{target}' (+0.10)"
-            )
-
-        # ── negative: restarted a healthy server ─────────────────────────
-        if atype == ActionType.RestartService:
-            if target_srv is not None and target_srv.status in (
-                ServerStatus.healthy, "healthy"
-            ):
-                breakdown["restart_healthy"] = -0.15
-                score -= 0.15
-                reasons.append(
-                    f"Restarted already-healthy server '{target}' (-0.15)"
-                )
-
-        # ── negative: same action+target repeated ≥3 times lately ───────
-        repeat_key  = f"{action.action_type}::{target}"
-        repeat_count = sum(1 for k in self._action_repeat_window if k == repeat_key)
-        # Note: the current action was already appended before this call,
-        # so repeat_count == 3 means this is the 3rd+ consecutive repeat.
-        if repeat_count >= 3:
-            breakdown["repeat_penalty"] = -0.20
-            score -= 0.20
-            reasons.append(
-                f"Same action+target '{repeat_key}' repeated {repeat_count}× (-0.20)"
-            )
-
-        # ── negative: site went down this step ───────────────────────────
+        # Penalty: site went down this step
         if prev_site_up and not site_up:
             breakdown["site_down"] = -0.50
             score -= 0.50
-            reasons.append("Site went completely DOWN this step (-0.50)")
+            penalties.append("Site went DOWN this step (-0.50)")
 
-        # ── negative: unnecessary ScaleUp under low load ─────────────────
+        # Penalty: repeated same action+target 3× in last 3 steps
+        repeat_key   = f"{action.action_type}::{target}"
+        repeat_count = sum(1 for k in self._action_repeat_window if k == repeat_key)
+        if repeat_count >= 3:
+            breakdown["repeat_penalty"] = -0.20
+            score -= 0.20
+            penalties.append(
+                f"Repeated '{action.action_type}' on '{target}' "
+                f"{repeat_count}× (-0.20)"
+            )
+
+        # Penalty: unnecessary ScaleUp under low average CPU
+        prev_servers: Dict[str, Server] = prev_state["servers"]
         if atype == ActionType.ScaleUp and target in prev_servers:
-            role = None
-            # Retrieve role from simulator internal state if possible; else
-            # fall back to heuristic from server id prefix.
-            for sid, srv in prev_servers.items():
-                if sid == target:
-                    # Server model has no role field; use id prefix heuristic
-                    if target.startswith("web"):
-                        role = "web"
-                    elif target.startswith("api"):
-                        role = "api"
-                    elif target.startswith("db"):
-                        role = "db"
-                    elif target.startswith("cache"):
-                        role = "cache"
-                    break
-
-            if role is not None:
-                role_servers = [
-                    s for sid, s in prev_servers.items()
-                    if sid.startswith(role.split("-")[0])
-                ]
-                avg_cpu = (
-                    sum(s.cpu for s in role_servers) / len(role_servers)
-                    if role_servers else 0.0
+            prefix = target.split("-")[0]   # e.g.  "api" from "api-gw-1"
+            role_servers = [
+                s for sid, s in prev_servers.items()
+                if sid.startswith(prefix)
+            ]
+            avg_cpu = (
+                sum(s.cpu for s in role_servers) / len(role_servers)
+                if role_servers else 0.0
+            )
+            if avg_cpu < _LOW_LOAD:
+                breakdown["unnecessary_scaleup"] = -0.10
+                score -= 0.10
+                penalties.append(
+                    f"ScaleUp on '{target}' while avg CPU was "
+                    f"{avg_cpu:.1f}% < {_LOW_LOAD}% (-0.10)"
                 )
-                if avg_cpu < _LOW_LOAD:
-                    breakdown["unnecessary_scaleup"] = -0.10
-                    score -= 0.10
-                    reasons.append(
-                        f"ScaleUp on '{target}' while avg CPU was low "
-                        f"({avg_cpu:.1f}% < {_LOW_LOAD}%) (-0.10)"
-                    )
 
-        # ── clamp and assemble ───────────────────────────────────────────
-        score = max(0.0, min(1.0, score))
+        # ── 3. Clamp ──────────────────────────────────────────────────────
+        score = round(max(0.0, min(1.0, score)), 4)
 
-        feedback = "; ".join(reasons) if reasons else "No significant events this step."
+        # ── 4. Rich feedback narrative ────────────────────────────────────
+        feedback = self._build_feedback(penalties)
 
         return Reward(
-            score       = round(score, 4),
-            breakdown   = {k: round(v, 4) for k, v in breakdown.items()},
+            score       = score,
+            breakdown   = breakdown,
             feedback    = feedback,
             done        = done,
             total_ticks = self._episode_tick,
         )
+
+    def _build_feedback(self, penalties: List[str]) -> str:
+        """
+        Narrate what the agent has done so far in plain English,
+        followed by any step-level penalty descriptions.
+        """
+        # Summarise action history as a readable sentence
+        history = self._action_full_history
+        if not history:
+            summary = "No actions taken yet."
+        else:
+            parts: List[str] = []
+            for act in history:
+                aname = act.action_type
+                tid   = act.target_id
+                if aname == "RestartService":
+                    parts.append(f"restarted {tid}")
+                elif aname == "InvestigateLog":
+                    parts.append(f"investigated logs on {tid}")
+                elif aname == "RollbackDeployment":
+                    parts.append(f"rolled back deployment to {tid}")
+                elif aname == "ScaleUp":
+                    parts.append(f"scaled up {tid}")
+                elif aname == "ScaleDown":
+                    parts.append(f"scaled down {tid}")
+                elif aname == "KillProcess":
+                    parts.append(f"killed process on {tid}")
+                elif aname == "FlushCache":
+                    parts.append(f"flushed cache on {tid}")
+                elif aname == "FailoverDatabase":
+                    parts.append(f"failed over database to {tid}")
+                else:
+                    parts.append(f"{aname} on {tid}")
+            summary = "Agent has: " + ", ".join(parts) + "."
+
+        if penalties:
+            return summary + " | Penalties: " + "; ".join(penalties)
+        return summary
 
     # ------------------------------------------------------------------
     # Episode termination logic
