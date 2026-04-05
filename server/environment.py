@@ -514,10 +514,13 @@ class SREEnvironment:
         """
         Evaluate whether the episode should end.
 
-        Episode ends when:
-          - ``self._episode_tick >= self._task.max_ticks``
-          - OR ``site_uptime`` is False (site is down)
-          - OR task-specific success condition met
+        Episode ends ONLY when:
+          1. ``self._episode_tick >= self._task.max_ticks``  (budget exhausted)
+          2. ``site_uptime`` is False                        (site is down)
+
+        Bad actions, repeated actions, and low reward scores do NOT end the
+        episode early — penalties are reflected in the score only.  The agent
+        always gets to try a different action on the next tick.
 
         Returns
         -------
@@ -526,21 +529,17 @@ class SREEnvironment:
         """
         assert self._task is not None
 
-        # 1. Tick limit reached
+        # 1. Tick-limit exhausted
         if self._episode_tick >= self._task.max_ticks:
             return True, f"max_ticks ({self._task.max_ticks}) reached"
 
-        # 2. Site is down — end immediately
+        # 2. Site completely down
         if not site_up:
             return True, (
                 f"Site is DOWN (site_uptime=False) at tick {self._episode_tick}"
             )
 
-        # 3. Task-specific success conditions
-        done, reason = self._check_task_success()
-        if done:
-            return True, reason
-
+        # Episode continues — agent may take another action
         return False, ""
 
     def _check_task_success(self) -> Tuple[bool, str]:
