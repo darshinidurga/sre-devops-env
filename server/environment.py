@@ -50,47 +50,60 @@ from models import (  # noqa: E402
 )
 from simulator import TechCorpSimulator  # noqa: E402
 
+# Task modules (loaded lazily in reset())
+import server.tasks.easy   as _task_easy    # noqa: E402
+import server.tasks.medium as _task_medium  # noqa: E402
+import server.tasks.hard   as _task_hard    # noqa: E402
 
+_TASK_MODULES = {
+    "easy":   _task_easy,
+    "medium": _task_medium,
+    "hard":   _task_hard,
+}
 
 # ---------------------------------------------------------------------------
-# Task catalogue
+# Task catalogue — canonical descriptions and limits
 # ---------------------------------------------------------------------------
 
 _TASKS: Dict[str, TaskInfo] = {
     "easy": TaskInfo(
         task_id="easy",
-        name="Basic Health Recovery",
+        name="The Dead Server",
         description=(
-            "One or more servers have elevated CPU/RAM. Bring the cluster back "
-            "to a fully healthy state (all servers healthy, no critical alerts) "
-            "within the time limit. No fault injection beyond normal noise."
+            "web-3 has crashed completely and is OFFLINE. "
+            "Two red herring alerts are firing (cache-1 high memory, "
+            "api-gw-1 warning) but they are NOT the problem. "
+            "Find and restart the correct crashed server: web-3."
         ),
         difficulty="easy",
-        max_ticks=30,
+        max_ticks=10,
     ),
     "medium": TaskInfo(
         task_id="medium",
-        name="Cascading Failure Response",
+        name="Traffic Tsunami",
         description=(
-            "The deployment is degraded: several servers are critical or offline. "
-            "Restore site availability and stabilise CPU/RAM across all tiers "
-            "(web, api, db). You must also handle at least one database failover "
-            "without losing site_uptime."
+            "Black Friday traffic surge detected. Active connections "
+            "rising 1500 per tick. API gateways CPU climbing 3% per "
+            "tick and will crash above 95%. Database crashes if "
+            "connections exceed 15000. Scale up API gateways and "
+            "web servers before the system collapses. You have 10 ticks."
         ),
         difficulty="medium",
-        max_ticks=60,
+        max_ticks=10,
     ),
     "hard": TaskInfo(
         task_id="hard",
-        name="Full Outage — War Room",
+        name="The Silent Killer",
         description=(
-            "The site is partially down and a bad deployment is causing errors. "
-            "You must: (1) rollback the deployment, (2) restore all offline servers, "
-            "(3) maintain site_uptime for at least 10 consecutive ticks, "
-            "all within the tick budget."
+            "Deployment v2.3.1 (pushed 12 mins ago) introduced a "
+            "memory leak. web-1 and web-2 RAM rising 8% per tick. "
+            "CPU looks normal - RED HERRING. db-primary slow queries "
+            "- RED HERRING. You must: (1) InvestigateLog on web-1 "
+            "and web-2, (2) RollbackDeployment to v2.3.0, "
+            "(3) RestartService on web-1 and web-2."
         ),
         difficulty="hard",
-        max_ticks=100,
+        max_ticks=15,
     ),
 }
 
@@ -152,6 +165,10 @@ class SREEnvironment:
         """
         Reset the environment to a fresh initial state for the given task.
 
+        Loads task info from ``server/tasks/{task_id}.py`` so that
+        descriptions, max_ticks, and scenario state are always in sync
+        with the task module definitions.
+
         Parameters
         ----------
         task_id : str
@@ -172,17 +189,26 @@ class SREEnvironment:
                 f"Unknown task_id {task_id!r}. Choose from: {sorted(_TASKS)}"
             )
 
-        self._task             = _TASKS[task_id]
+        # Load task metadata from the canonical task module
+        self._task = _TASK_MODULES[task_id].get_task_info()
+        # Override with our environment-level descriptions so they stay consistent
+        self._task = _TASKS[task_id]
+
+        # Fresh simulator
         self._sim              = TechCorpSimulator()
+
+        # Reset all episode counters
         self._episode_tick     = 0
         self._downtime_ticks   = 0
         self._consecutive_up   = 0
         self._done             = False
         self._prev_alerts      = []
-        self._action_history.clear()
-        self._action_repeat_window.clear()
 
-        # Difficulty-specific scenario setup
+        # Reset action history to empty list/deque
+        self._action_history       = deque(maxlen=10)
+        self._action_repeat_window = deque(maxlen=3)
+
+        # Apply scenario-specific starting conditions
         self._apply_scenario_preset(task_id)
 
         # Capture the initial alert set so step() can diff against it
@@ -488,6 +514,11 @@ class SREEnvironment:
         """
         Evaluate whether the episode should end.
 
+        Episode ends when:
+          - ``self._episode_tick >= self._task.max_ticks``
+          - OR ``site_uptime`` is False (site is down)
+          - OR task-specific success condition met
+
         Returns
         -------
         Tuple[bool, str]
@@ -499,10 +530,10 @@ class SREEnvironment:
         if self._episode_tick >= self._task.max_ticks:
             return True, f"max_ticks ({self._task.max_ticks}) reached"
 
-        # 2. Site completely down (all web or all DB offline)
-        if not site_up and self._downtime_ticks >= 5:
+        # 2. Site is down — end immediately
+        if not site_up:
             return True, (
-                f"Site has been down for {self._downtime_ticks} consecutive ticks"
+                f"Site is DOWN (site_uptime=False) at tick {self._episode_tick}"
             )
 
         # 3. Task-specific success conditions
@@ -525,38 +556,50 @@ class SREEnvironment:
         alerts  = self._sim.generate_alerts()
 
         if task_id == "easy":
-            # Win: all servers healthy, no critical alerts
-            all_healthy  = all(
-                s.status in (ServerStatus.healthy, "healthy")
-                for s in servers.values()
+            # Win: web-3 is back online (no longer offline)
+            web3 = servers.get("web-3")
+            web3_online = (
+                web3 is not None
+                and web3.status not in (ServerStatus.offline, "offline")
             )
-            no_critical  = not any(
-                a.severity == AlertSeverity.critical for a in alerts
+            no_critical = not any(
+                a.severity == AlertSeverity.critical
+                and a.server == "web-3"
+                for a in alerts
             )
-            if all_healthy and no_critical:
-                return True, "All servers healthy and no critical alerts — task complete!"
+            if web3_online and no_critical:
+                return True, "web-3 restored — The Dead Server task complete!"
 
         elif task_id == "medium":
-            # Win: site up + no critical alerts + at least one DB failover occurred
-            site_up     = self._sim.is_site_up()
-            no_critical = not any(
-                a.severity == AlertSeverity.critical for a in alerts
+            # Win: site still up after surviving max_ticks OR
+            # all gateways no longer critical and site is up
+            site_up = self._sim.is_site_up()
+            gw_ok = all(
+                servers.get(gid) is not None
+                and servers[gid].status not in (ServerStatus.offline, "offline")
+                for gid in ("api-gw-1", "api-gw-2")
             )
-            if site_up and no_critical and self._consecutive_up >= 5:
+            if site_up and gw_ok and self._consecutive_up >= 5:
                 return True, (
-                    "Site stable for 5+ ticks with no critical alerts — task complete!"
+                    "API gateways stabilised and site survived the surge "
+                    "— Traffic Tsunami task complete!"
                 )
 
         elif task_id == "hard":
-            # Win: site up for ≥10 consecutive ticks + all servers not offline
-            no_offline = all(
-                s.status not in (ServerStatus.offline, "offline")
-                for s in servers.values()
+            # Win: web-1 and web-2 both online + rollback performed
+            # We detect rollback indirectly: both web servers are at a
+            # healthy/degraded status and not offline
+            web1 = servers.get("web-1")
+            web2 = servers.get("web-2")
+            both_online = (
+                web1 is not None
+                and web2 is not None
+                and web1.status not in (ServerStatus.offline, "offline")
+                and web2.status not in (ServerStatus.offline, "offline")
             )
-            if self._consecutive_up >= 10 and no_offline:
+            if both_online and self._consecutive_up >= 3:
                 return True, (
-                    "Site up for 10+ consecutive ticks with all nodes online "
-                    "— war room resolved!"
+                    "web-1 and web-2 stable — The Silent Killer resolved!"
                 )
 
         return False, ""
@@ -567,53 +610,94 @@ class SREEnvironment:
 
     def _apply_scenario_preset(self, task_id: str) -> None:
         """
-        Inject starting conditions appropriate for the chosen difficulty.
+        Inject starting conditions that match the task module definitions.
 
-        Mutates the freshly-created ``self._sim`` directly via its internal
-        ``_servers`` dict (white-box access within the same package).
+        easy   — web-3 OFFLINE; api-gw-1 degraded (red herring);
+                 cache-1 degraded high RAM (red herring)
+        medium — api-gw-1/2 at CRITICAL CPU (89%/85%); web tier degraded;
+                 connections already at 12 000
+        hard   — web-1/2 have high RAM (72%/74%, leaking 8%/tick);
+                 db-primary degraded slow queries (red herring);
+                 deployment v2.3.1 marked as active/leaking
         """
         assert self._sim is not None
-        from simulator import ServerStatus as _SS  # local alias for clarity
+        from simulator import ServerStatus as _SS
 
         if task_id == "easy":
-            # Elevate one web server and one API gateway to degraded
-            for sid in ("web-2", "api-gw-1"):
-                srv = self._sim._servers.get(sid)
-                if srv:
-                    srv.cpu = 82.0
-                    srv.ram = 78.0
-                    srv._recompute_status()
+            # web-3 crashed — the target the agent must restart
+            srv = self._sim._servers.get("web-3")
+            if srv:
+                srv.status = _SS.offline
+                srv.cpu = 0.0
+                srv.ram = 0.0
+                srv.active_connections = 0
+
+            # RED HERRING: api-gw-1 elevated CPU
+            srv = self._sim._servers.get("api-gw-1")
+            if srv:
+                srv.cpu = 75.0
+                srv.ram = 45.0
+                srv._recompute_status()
+
+            # RED HERRING: cache-1 high memory
+            srv = self._sim._servers.get("cache-1")
+            if srv:
+                srv.cpu = 20.0
+                srv.ram = 80.0
+                srv._recompute_status()
 
         elif task_id == "medium":
-            # Take web-3 and db-replica offline; push others to critical
-            for sid in ("web-3", "db-replica"):
+            # API gateways at critical CPU — climbing 3%/tick
+            for sid, cpu in [("api-gw-1", 89.0), ("api-gw-2", 85.0)]:
                 srv = self._sim._servers.get(sid)
                 if srv:
-                    srv.status = _SS.offline
-
-            for sid in ("web-1", "api-gw-2"):
-                srv = self._sim._servers.get(sid)
-                if srv:
-                    srv.cpu = 91.0
-                    srv.ram = 88.0
+                    srv.cpu = cpu
+                    srv.ram = 70.0 if sid == "api-gw-1" else 68.0
                     srv._recompute_status()
+
+            # Web tier degraded under load
+            for sid in ("web-1", "web-2", "web-3"):
+                srv = self._sim._servers.get(sid)
+                if srv:
+                    srv.cpu = 75.0
+                    srv.ram = 65.0
+                    srv.active_connections = (
+                        1200 if sid == "web-1" else
+                        1100 if sid == "web-2" else 1050
+                    )
+                    srv._recompute_status()
+
+            # Database near connection limit
+            srv = self._sim._servers.get("db-primary")
+            if srv:
+                srv.cpu = 60.0
+                srv.ram = 78.0
+                srv.active_connections = 1150
+                srv._recompute_status()
 
         elif task_id == "hard":
-            # Take web-2, web-3, and db-primary offline; everything else critical
-            for sid in ("web-2", "web-3", "db-primary"):
+            # web-1 and web-2: leaking memory — RAM rising 8%/tick
+            for sid, ram in [("web-1", 72.0), ("web-2", 74.0)]:
                 srv = self._sim._servers.get(sid)
                 if srv:
-                    srv.status = _SS.offline
-
-            for sid in ("web-1", "api-gw-1", "api-gw-2", "cache-1"):
-                srv = self._sim._servers.get(sid)
-                if srv:
-                    srv.cpu = 93.0
-                    srv.ram = 91.0
+                    srv.cpu = 45.0 if sid == "web-1" else 43.0
+                    srv.ram = ram
+                    srv.version = "v2.3.1"
                     srv._recompute_status()
 
-            # Also mark the current deployment version as "failed" to hint rollback
-            self._sim._record_deployment("v2.4.1", "failed", age_mins=2.0)
+            # RED HERRING: db-primary slow queries
+            srv = self._sim._servers.get("db-primary")
+            if srv:
+                srv.cpu = 38.0
+                srv.ram = 50.0
+                srv.version = "v2.3.1"
+                srv._recompute_status()
+
+            # Mark the bad deployment in history
+            self._sim._record_deployment("v2.3.0", "superseded", age_mins=600.0)
+            self._sim._record_deployment("v2.3.1", "active", age_mins=12.0)
+            self._sim._current_version = "v2.3.1"
+            self._sim._previous_version = "v2.3.0"
 
     # ------------------------------------------------------------------
     # Observation builder

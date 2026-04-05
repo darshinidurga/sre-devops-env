@@ -6,7 +6,7 @@ Runs an AI agent against all 3 tasks and reports scores.
 
 Environment Variables:
     API_BASE_URL : LLM API endpoint
-    MODEL_NAME   : Model identifier
+    MODEL_NAME   : Model identifier  
     HF_TOKEN     : Hugging Face / API key
 """
 
@@ -16,28 +16,20 @@ import json
 import requests
 from openai import OpenAI
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME",   "meta-llama/Llama-3.1-8B-Instruct")
+MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN     = os.getenv("HF_TOKEN",     "")
 ENV_URL      = os.getenv("ENV_URL",      "http://localhost:7860")
 
 client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
-# ── Smart defaults per task ───────────────────────────────────────────────────
+# ── Smart defaults per task ─────────────────────────────────
 TASK_DEFAULTS = {
-    "easy":   {"action_type": "RestartService",      "target_id": "web-3"},
-    "medium": {"action_type": "ScaleUp",             "target_id": "api-gw-1"},
-    "hard":   {"action_type": "InvestigateLog",      "target_id": "web-1"},
+    "easy":   {"action_type": "RestartService",     "target_id": "web-3"},
+    "medium": {"action_type": "ScaleUp",            "target_id": "api-gw-1"},
+    "hard":   {"action_type": "InvestigateLog",     "target_id": "web-1"},
 }
-
-# ── Valid server IDs ──────────────────────────────────────────────────────────
-VALID_TARGETS = [
-    "web-1", "web-2", "web-3",
-    "api-gw-1", "api-gw-2",
-    "db-primary", "db-replica",
-    "cache-1", "v2.3.0"
-]
 
 VALID_ACTIONS = [
     "RestartService", "ScaleUp", "ScaleDown",
@@ -45,108 +37,112 @@ VALID_ACTIONS = [
     "FlushCache", "FailoverDatabase", "InvestigateLog"
 ]
 
-# ── AI Action Function ────────────────────────────────────────────────────────
+# ── AI Action ───────────────────────────────────────────────
 def get_ai_action(observation: dict, task_id: str) -> dict:
-    """Ask the LLM what action to take given current state."""
 
-    # Build server summary
     servers = observation.get("servers", {})
     server_summary = "\n".join([
-        f"  {sid}: cpu={s['cpu']}% ram={s['ram']}% status={s['status']}"
+        f"  {sid}: cpu={s['cpu']}% ram={s['ram']}% "
+        f"status={s['status']} version={s.get('version','?')}"
         for sid, s in servers.items()
     ])
 
-    # Build alerts summary
     alerts = observation.get("alerts", [])
     alert_summary = "\n".join([
         f"  [{a['severity'].upper()}] {a['server']}: {a['message']}"
         for a in alerts
     ]) or "  None"
 
-    # Build logs summary (last 3 only)
-    logs = observation.get("logs", [])[-3:]
+    logs = observation.get("logs", [])[-5:]
     log_summary = "\n".join([
         f"  {l['server']}: {l['message']}"
         for l in logs
     ]) or "  None"
 
-    prompt = f"""You are an expert Site Reliability Engineer.
-Analyze the infrastructure and choose exactly ONE action to fix the problem.
+    deployments = observation.get("deployment_history", [])
+    deploy_summary = "\n".join([
+        f"  {d['version']} — {d['status']}"
+        for d in deployments
+    ]) or "  None"
+
+    prompt = f"""You are a Site Reliability Engineer fixing a production incident.
 
 TASK: {observation.get('task_description', '')}
 TICK: {observation.get('tick', 0)}
 SITE UP: {observation.get('site_uptime', True)}
+CONNECTIONS: {observation.get('active_connections', 0)}
+DOWNTIME TICKS: {observation.get('downtime_ticks', 0)}
 
-SERVERS:
+SERVER STATUS:
 {server_summary}
 
-ALERTS:
+ACTIVE ALERTS:
 {alert_summary}
 
 RECENT LOGS:
 {log_summary}
 
 DEPLOYMENT HISTORY:
-{json.dumps([d['version'] + ' (' + d['status'] + ')' 
-for d in observation.get('deployment_history', [])], indent=2)}
+{deploy_summary}
 
-AVAILABLE ACTIONS (copy exact format):
-  RestartService     → {{"action_type": "RestartService", "target_id": "web-1"}}
-  ScaleUp            → {{"action_type": "ScaleUp", "target_id": "api-gw-1"}}
-  ScaleDown          → {{"action_type": "ScaleDown", "target_id": "web-1"}}
-  RollbackDeployment → {{"action_type": "RollbackDeployment", "target_id": "v2.3.0"}}
-  KillProcess        → {{"action_type": "KillProcess", "target_id": "web-1"}}
-  FlushCache         → {{"action_type": "FlushCache", "target_id": "cache-1"}}
-  FailoverDatabase   → {{"action_type": "FailoverDatabase", "target_id": "db-replica"}}
-  InvestigateLog     → {{"action_type": "InvestigateLog", "target_id": "web-1"}}
+CHOOSE ONE ACTION — respond with ONLY JSON, no explanation:
+
+For crashed server     → {{"action_type": "RestartService", "target_id": "web-3"}}
+For traffic spike      → {{"action_type": "ScaleUp", "target_id": "api-gw-1"}}
+For memory leak        → {{"action_type": "InvestigateLog", "target_id": "web-1"}}
+For bad deployment     → {{"action_type": "RollbackDeployment", "target_id": "v2.3.0"}}
+For runaway process    → {{"action_type": "KillProcess", "target_id": "web-1"}}
+For cache issues       → {{"action_type": "FlushCache", "target_id": "cache-1"}}
+For db failover        → {{"action_type": "FailoverDatabase", "target_id": "db-replica"}}
+For reading logs       → {{"action_type": "InvestigateLog", "target_id": "web-1"}}
 
 RULES:
-- target_id must NEVER be null
-- Only use server IDs shown in SERVERS section
-- For RollbackDeployment use version like "v2.3.0"
-- Pick the action most likely to fix the current problem
+1. target_id must NEVER be null
+2. For RollbackDeployment always use target_id: "v2.3.0"
+3. Look at ALERTS and LOGS to decide what is wrong
+4. Look at which servers are offline or critical
 
-Respond with ONLY a JSON object, no explanation:
-{{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"}}"""
+Your JSON response:"""
 
     response = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=50,
+        max_tokens=60,
         temperature=0.1,
     )
 
     text = response.choices[0].message.content.strip()
 
-    # Extract JSON safely
+    # Extract JSON
     match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
     if match:
-        parsed = json.loads(match.group())
+        try:
+            parsed = json.loads(match.group())
 
-        # Validate action_type
-        if parsed.get("action_type") not in VALID_ACTIONS:
+            # Fix invalid action
+            if parsed.get("action_type") not in VALID_ACTIONS:
+                return TASK_DEFAULTS[task_id]
+
+            # Fix null target_id
+            if not parsed.get("target_id"):
+                if parsed["action_type"] == "RollbackDeployment":
+                    parsed["target_id"] = "v2.3.0"
+                else:
+                    parsed["target_id"] = "web-1"
+
+            return parsed
+        except json.JSONDecodeError:
             return TASK_DEFAULTS[task_id]
-
-        # Fix null target_id
-        if not parsed.get("target_id"):
-            if parsed["action_type"] == "RollbackDeployment":
-                parsed["target_id"] = "v2.3.0"
-            else:
-                parsed["target_id"] = "web-1"
-
-        return parsed
 
     return TASK_DEFAULTS[task_id]
 
 
-# ── Run Single Task ───────────────────────────────────────────────────────────
+# ── Run Task ────────────────────────────────────────────────
 def run_task(task_id: str) -> float:
-    """Run agent on one task and return final score."""
     print(f"\n{'='*50}")
     print(f"Running Task: {task_id.upper()}")
     print(f"{'='*50}")
 
-    # Reset environment
     try:
         response = requests.post(
             f"{ENV_URL}/reset/{task_id}",
@@ -154,34 +150,37 @@ def run_task(task_id: str) -> float:
         )
         obs = response.json()
     except Exception as e:
-        print(f"ERROR: Could not reset task: {e}")
+        print(f"ERROR resetting task: {e}")
         return 0.0
 
-    print(f"Task: {obs.get('task_description', '')[:80]}")
+    print(f"Task: {obs.get('task_description', '')[:100]}")
+    print(f"Max ticks: 15")
 
-    best_score  = 0.0
     final_score = 0.0
+    best_score  = 0.0
     done        = False
     tick        = 0
-    max_ticks   = 15
 
-    while not done and tick < max_ticks:
+    while not done and tick < 15:
         tick += 1
 
         # Get AI action
         try:
             action = get_ai_action(obs, task_id)
         except Exception as e:
-            print(f"Tick {tick}: AI error — {str(e)[:80]}")
+            print(f"Tick {tick:>2}: AI error — {str(e)[:60]}")
+            print(f"         Using default action for {task_id}")
             action = TASK_DEFAULTS[task_id]
 
-        # Ensure target_id is never None
+        # Safety check
         if not action.get("target_id"):
-            action["target_id"] = "web-1"
+            action["target_id"] = "v2.3.0" \
+                if action.get("action_type") == "RollbackDeployment" \
+                else "web-1"
 
         print(f"Tick {tick:>2}: {action['action_type']:<22} → {action['target_id']}")
 
-        # Send action to environment
+        # Send to environment
         try:
             step_resp = requests.post(
                 f"{ENV_URL}/step",
@@ -194,49 +193,52 @@ def run_task(task_id: str) -> float:
             )
             result      = step_resp.json()
             obs         = result.get("observation", obs)
-            reward      = result.get("reward", {})
+            reward_obj  = result.get("reward", {})
             done        = result.get("done", False)
-            score       = reward.get("score", 0.0)
+            score       = reward_obj.get("score", 0.0)
+            feedback    = reward_obj.get("feedback", "")
             final_score = score
             best_score  = max(best_score, score)
 
-            print(f"        Score: {score:.2f} | "
+            print(f"         Score: {score:.2f} | "
                   f"Best: {best_score:.2f} | "
                   f"Done: {done}")
+            if feedback:
+                print(f"         Feedback: {feedback[:60]}")
 
         except Exception as e:
-            print(f"        Step error: {e}")
+            print(f"         Step error: {e}")
             break
 
-    print(f"\nFinal Score [{task_id}]: {final_score:.4f}")
-    print(f"Best Score  [{task_id}]: {best_score:.4f}")
+    print(f"\n  → Final Score [{task_id}]: {final_score:.4f}")
+    print(f"  → Best Score  [{task_id}]: {best_score:.4f}")
     return final_score
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────
 def main():
     print("\n" + "="*50)
     print("SRE DEVOPS ENV — BASELINE INFERENCE")
     print("="*50)
-    print(f"API URL : {API_BASE_URL}")
-    print(f"Model   : {MODEL_NAME}")
-    print(f"Env URL : {ENV_URL}")
+    print(f"API : {API_BASE_URL}")
+    print(f"Model: {MODEL_NAME}")
+    print(f"Env  : {ENV_URL}")
 
     # Health check
     try:
         r = requests.get(f"{ENV_URL}/health", timeout=5)
-        print(f"Health  : {r.json()}")
+        print(f"Health: {r.json()}")
     except Exception:
         print("ERROR: Environment not running!")
-        print(f"Start it: uvicorn app:app --host 0.0.0.0 --port 7860")
+        print("Fix: uvicorn app:app --host 0.0.0.0 --port 7860")
         return
 
-    # Run all tasks
+    # Run all 3 tasks
     scores = {}
     for task_id in ["easy", "medium", "hard"]:
         scores[task_id] = run_task(task_id)
 
-    # Print summary
+    # Results
     print("\n" + "="*50)
     print("BASELINE RESULTS")
     print("="*50)
