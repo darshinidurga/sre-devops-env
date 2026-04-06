@@ -180,7 +180,20 @@ class SRESimulator:
         # 5. Check episode termination
         self.done = self._is_done(score)
 
-        # 6. Build structured response
+        # 6. Override score for hard-task rollback events
+        #    These are resolved inside _apply_action() via _meta flags so that
+        #    the rubric grader doesn't need to be aware of them.
+        if self.task_id == "hard":
+            hard_meta = self.state.get("_meta", {})
+            if hard_meta.get("rollback_victory", False) and self.done:
+                # First-time correct rollback → perfect victory score
+                score = 1.0
+            elif hard_meta.get("rollback_penalty", False):
+                # Duplicate rollback spam → penalty
+                score = -0.1
+                hard_meta["rollback_penalty"] = False  # consume; don't persist
+
+        # 7. Build structured response
         obs    = self._build_observation()
         reward = Reward(
             score=score,
@@ -301,13 +314,21 @@ class SRESimulator:
 
             if atype == ActionType.RollbackDeployment:
                 if target in ("v2.3.0", "v2.3.1"):
+                    if leak_stopped:
+                        # Already rolled back — penalise spam instead of rewarding
+                        meta["rollback_penalty"] = True
+                        return (
+                            f"RollbackDeployment rejected: system is already running v2.3.0. "
+                            "Duplicate rollback commands waste time and score negatively."
+                        )
+                    # First-time rollback — stop the leak and flag the victory
                     meta["leak_stopped"] = True
-                    # Update deployment history to reflect rollback
+                    meta["rollback_victory"] = True
                     history: List[Deployment] = self.state.get("deployment_history", [])
                     history.append(Deployment(version="v2.3.0", status="active", age_mins=0.0))
                     return (
-                        "Deployment v2.3.1 rolled back to v2.3.0. "
-                        "Memory leak HALTED. Now restart web-1 and web-2 to clear accumulated RAM."
+                        "SUCCESS: Deployment v2.3.1 rolled back to v2.3.0. "
+                        "Memory leak HALTED. Site is stable."
                     )
                 return f"RollbackDeployment to {target} — version not found in history."
 
@@ -379,7 +400,14 @@ class SRESimulator:
             )).status != ServerStatus.offline
 
         if self.task_id == "medium":
-            # Done when system collapses completely
+            # ── WIN condition: both gateways scaled up → capacity threshold met ──
+            scaled_gateways: set = meta.get("scaled_gateways", set())
+            gw_ids = {"api-gw-1", "api-gw-2"}
+            if gw_ids.issubset(scaled_gateways):
+                # Both gateways scaled — total capacity ≥ 4 units, traffic spike handled
+                return True
+
+            # ── LOSS condition: all gateways + DB offline → total collapse ─────
             gw1_down = servers.get("api-gw-1", Server(id="api-gw-1", cpu=0, ram=0, status=ServerStatus.offline, active_connections=0, version="unknown")).status == ServerStatus.offline
             gw2_down = servers.get("api-gw-2", Server(id="api-gw-2", cpu=0, ram=0, status=ServerStatus.offline, active_connections=0, version="unknown")).status == ServerStatus.offline
             db_down  = servers.get("db-primary", Server(id="db-primary", cpu=0, ram=0, status=ServerStatus.offline, active_connections=0, version="unknown")).status == ServerStatus.offline
@@ -388,7 +416,10 @@ class SRESimulator:
             return False
 
         if self.task_id == "hard":
-            # Done once rollback applied AND both affected servers restarted
+            # WIN path 1: Rollback just applied for the first time → immediate victory
+            if meta.get("rollback_victory", False):
+                return True
+            # WIN path 2 (legacy): rollback + both servers restarted
             restarted: set = meta.get("restarted", set())
             leak_stopped: bool = meta.get("leak_stopped", False)
             return leak_stopped and "web-1" in restarted and "web-2" in restarted

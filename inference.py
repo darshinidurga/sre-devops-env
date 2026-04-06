@@ -143,14 +143,22 @@ ACTIONS ALREADY TAKEN - DO NOT REPEAT:
 {recent_summary}
 
 STRICT RULES:
+STRICT RULES:
 1. NEVER repeat same action + target you already did
 2. target_id must NEVER be null or empty
 3. For RollbackDeployment → always use target_id: "v2.3.0"
-4. If you investigated web-1 already → investigate web-2 next
-5. After investigating logs → do RollbackDeployment next
-6. After RollbackDeployment → do RestartService on affected servers
-7. For crashed server → use RestartService on that server
-8. For traffic spike → use ScaleUp on api-gw-1 first
+4. HARD TASK SEQUENCE — follow this EXACTLY:
+   Step 1: InvestigateLog → web-1
+   Step 2: InvestigateLog → web-2  
+   Step 3: RollbackDeployment → v2.3.0
+   Step 4: RestartService → web-1
+   Step 5: RestartService → web-2
+5. If you already did InvestigateLog on web-1 AND web-2
+   → NEXT action MUST be RollbackDeployment(v2.3.0)
+6. If you already did RollbackDeployment
+   → NEXT action MUST be RestartService(web-1)
+7. If you already restarted web-1
+   → NEXT action MUST be RestartService(web-2)
 
 AVAILABLE ACTIONS:
   RestartService     → {{"action_type": "RestartService", "target_id": "web-3"}}
