@@ -1,24 +1,18 @@
 """
 app.py
 ------
-Flask HTTP server for the SRE DevOps OpenEnv simulation environment.
+FastAPI server for the SRE DevOps OpenEnv environment.
 
-Routes
-------
-GET  /health              — liveness probe
-GET  /tasks               — list all tasks and their metadata
-GET  /tasks/<task_id>     — info for a single task
-POST /reset/<task_id>     — start a new episode  → Observation JSON
-POST /step                — apply one action      → StepResponse JSON
-
-Run locally
------------
-    python app.py
-
-Or with a production WSGI server:
-    waitress-serve --host=0.0.0.0 --port=7860 app:app
-
-The ENV_PORT environment variable overrides the default port 7860.
+Endpoints
+---------
+GET  /health
+GET  /tasks
+GET  /tasks/{task_id}
+POST /reset
+POST /reset/{task_id}
+POST /step
+GET  /state
+GET  /docs  (auto-generated)
 """
 
 from __future__ import annotations
@@ -26,128 +20,146 @@ from __future__ import annotations
 import os
 import sys
 
-from flask import Flask, jsonify, request, Response
-
-# ---------------------------------------------------------------------------
-# Path bootstrap — ensure repo root importable when running from any CWD
-# ---------------------------------------------------------------------------
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from server.environment import SREEnvironment  # noqa: E402
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
-# ---------------------------------------------------------------------------
-# Flask app + shared environment instance
-# ---------------------------------------------------------------------------
-app = Flask(__name__)
-app.config["JSON_SORT_KEYS"] = False
+from server.environment import SREEnvironment
+
+# ── App setup ──────────────────────────────────────────────
+app = FastAPI(
+    title="SRE DevOps OpenEnv",
+    description="SRE Cloud DevOps Simulator for OpenEnv Hackathon",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 env = SREEnvironment()
 
+# ── Request models ─────────────────────────────────────────
+class ResetRequest(BaseModel):
+    task_id: str = "easy"
 
-# ---------------------------------------------------------------------------
-# Error helpers
-# ---------------------------------------------------------------------------
+class StepRequest(BaseModel):
+    action_type: str
+    target_id:   str
+    parameters:  Optional[Dict[str, Any]] = {}
 
-def _error(message: str, status: int = 400) -> Response:
-    return jsonify({"error": message}), status
+# ── Endpoints ──────────────────────────────────────────────
 
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health():
-    """Liveness probe — always returns 200 when the server is running."""
-    return jsonify({
+    """Liveness probe."""
+    return {
         "status": "ok",
+        "environment": "sre-devops-env",
         "current_task": env.current_task_id,
         "tick": env.current_tick,
         "done": env.is_done,
-    })
+    }
 
 
-@app.route("/tasks", methods=["GET"])
+@app.get("/tasks")
 def list_tasks():
-    """Return metadata for all registered tasks."""
-    return jsonify(env.all_task_info())
+    """List all tasks and metadata."""
+    return env.all_task_info()
 
 
-@app.route("/tasks/<task_id>", methods=["GET"])
+@app.get("/tasks/{task_id}")
 def get_task(task_id: str):
-    """Return metadata for a single task."""
+    """Get metadata for a single task."""
     try:
-        return jsonify(env.task_info(task_id))
-    except ValueError as exc:
-        return _error(str(exc), 404)
+        return env.task_info(task_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
-@app.route("/reset/<task_id>", methods=["POST", "GET"])
-def reset(task_id: str):
-    """
-    Start a fresh episode for *task_id*.
-
-    Returns the initial Observation as JSON.
-    Accepts both POST (as inference.py uses) and GET for browser convenience.
-    """
+@app.post("/reset")
+def reset_post(body: ResetRequest):
+    """Reset environment with task_id in body."""
     try:
-        observation = env.reset(task_id)
-        return jsonify(observation)
-    except ValueError as exc:
-        return _error(str(exc), 404)
-    except Exception as exc:
-        return _error(f"Reset failed: {exc}", 500)
+        return env.reset(body.task_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.route("/step", methods=["POST"])
-def step():
-    """
-    Apply one action to the current episode.
-
-    Expected JSON body::
-
-        {
-            "action_type": "RestartService",
-            "target_id":   "web-3",
-            "parameters":  {}          (optional)
-        }
-
-    Returns a StepResponse (observation + reward + done).
-    """
-    body = request.get_json(silent=True) or {}
-
-    action_type = body.get("action_type", "").strip()
-    target_id   = body.get("target_id",   "").strip()
-    parameters  = body.get("parameters") or {}
-
-    if not action_type:
-        return _error("Missing required field: action_type")
-    if not target_id:
-        return _error("Missing required field: target_id")
-
+@app.post("/reset/{task_id}")
+def reset_by_path(task_id: str):
+    """Reset environment with task_id in URL."""
     try:
-        step_resp = env.step(
-            action_type=action_type,
-            target_id=target_id,
-            parameters=parameters if parameters else None,
+        return env.reset(task_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/reset/{task_id}")
+def reset_by_path_get(task_id: str):
+    """Reset environment GET version for browser testing."""
+    try:
+        return env.reset(task_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/step")
+def step(body: StepRequest):
+    """Apply one action to current episode."""
+    if not body.action_type:
+        raise HTTPException(status_code=400, detail="Missing action_type")
+    if not body.target_id:
+        raise HTTPException(status_code=400, detail="Missing target_id")
+    try:
+        return env.step(
+            action_type=body.action_type,
+            target_id=body.target_id,
+            parameters=body.parameters,
         )
-        return jsonify(step_resp)
-    except ValueError as exc:
-        return _error(str(exc), 422)
-    except RuntimeError as exc:
-        return _error(str(exc), 409)
-    except Exception as exc:
-        return _error(f"Step failed: {exc}", 500)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+@app.get("/state")
+def state():
+    """Get current environment state."""
+    try:
+        if env.current_task_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail="No active episode. Call /reset first."
+            )
+        return env.reset(env.current_task_id) \
+            if env._sim.state is None \
+            else env._sim._build_observation().model_dump()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
+
+# ── Entry point ────────────────────────────────────────────
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.getenv("ENV_PORT", "7860"))
     print(f"SRE OpenEnv starting on http://0.0.0.0:{port}")
-    print("Routes: GET /health  GET /tasks  POST /reset/<task_id>  POST /step")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    uvicorn.run(app, host="0.0.0.0", port=port)
