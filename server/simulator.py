@@ -364,6 +364,9 @@ class SRESimulator:
         if self.tick >= max_ticks:
             return True
 
+        if not self._is_site_up():
+            return True
+
         servers = self.state["servers"]
         meta    = self.state.get("_meta", {})
 
@@ -372,14 +375,14 @@ class SRESimulator:
             return servers.get("web-3", Server(
                 id="web-3", cpu=0, ram=0,
                 status=ServerStatus.offline,
-                active_connections=0, version=""
+                active_connections=0, version="unknown"
             )).status != ServerStatus.offline
 
         if self.task_id == "medium":
             # Done when system collapses completely
-            gw1_down = servers.get("api-gw-1", Server(id="api-gw-1", cpu=0, ram=0, status=ServerStatus.offline, active_connections=0, version="")).status == ServerStatus.offline
-            gw2_down = servers.get("api-gw-2", Server(id="api-gw-2", cpu=0, ram=0, status=ServerStatus.offline, active_connections=0, version="")).status == ServerStatus.offline
-            db_down  = servers.get("db-primary", Server(id="db-primary", cpu=0, ram=0, status=ServerStatus.offline, active_connections=0, version="")).status == ServerStatus.offline
+            gw1_down = servers.get("api-gw-1", Server(id="api-gw-1", cpu=0, ram=0, status=ServerStatus.offline, active_connections=0, version="unknown")).status == ServerStatus.offline
+            gw2_down = servers.get("api-gw-2", Server(id="api-gw-2", cpu=0, ram=0, status=ServerStatus.offline, active_connections=0, version="unknown")).status == ServerStatus.offline
+            db_down  = servers.get("db-primary", Server(id="db-primary", cpu=0, ram=0, status=ServerStatus.offline, active_connections=0, version="unknown")).status == ServerStatus.offline
             if gw1_down and gw2_down and db_down:
                 return True
             return False

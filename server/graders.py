@@ -99,7 +99,11 @@ class TaskGrader:
         tid = task_id.strip().lower()
         
         if tid == "easy":
-            return easy_grade(action_history=action_history)
+            return easy_grade(
+                action_history=action_history,
+                final_state=final_state,
+                ticks_used=ticks_used,
+            )
         elif tid == "medium":
             return medium_grade(
                 action_history=action_history,

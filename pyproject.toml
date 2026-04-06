@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sre-devops-env"
+version = "0.1.0"
+description = "SRE DevOps Simulator"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi==0.115.0",
+    "uvicorn==0.30.0",
+    "pydantic==2.7.0",
+    "openai==1.30.0",
+    "requests==2.32.0",
+    "python-dotenv==1.0.0",
+    "openenv-core"
+]
+
+[project.scripts]
+server = "server.app:main"
