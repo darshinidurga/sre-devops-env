@@ -98,7 +98,7 @@ This environment was tested using **Qwen/Qwen2.5-72B-Instruct** via the Hugging 
 ```bash
 pip install fastapi uvicorn pydantic openai requests openenv-core uv
 
-Run Locally (Development)
+##Run Locally (Development)
 
 # Generate lock file
 uv lock
@@ -107,11 +107,11 @@ uv lock
 uvicorn server.app:app --host 0.0.0.0 --port 7860
 
 # In a separate terminal, run the agent:
-export API_BASE_URL=[https://router.huggingface.co/v1](https://router.huggingface.co/v1)
+export API_BASE_URL=https://router.huggingface.co/v1
 export MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
 export HF_TOKEN=your_hf_token
 python inference.py
 
-docker deplayment
+##docker deployment
 docker build -t sre-devops-env .
 docker run -p 7860:7860 sre-devops-env
