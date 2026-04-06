@@ -17,7 +17,6 @@ tags:
 
 [![OpenEnv Compliant](https://img.shields.io/badge/OpenEnv-Compliant-brightgreen.svg)]()
 [![Docker Ready](https://img.shields.io/badge/Docker-Ready-blue.svg)]()
-[![Phase 1 Validated](https://img.shields.io/badge/Hackathon-Phase_1_Passed-gold.svg)]()
 
 ## 📖 The Problem: AI in Enterprise Infrastructure
 Modern enterprises lose millions of dollars for every hour their cloud infrastructure is offline. While Human Site Reliability Engineers (SREs) use complex reasoning to diagnose logs, ignore "red herring" alerts, and safely mitigate production outages, current AI agents lack a safe, deterministic sandbox to practice these high-stakes skills. 
