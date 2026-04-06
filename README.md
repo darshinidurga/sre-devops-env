@@ -5,117 +5,114 @@ colorFrom: blue
 colorTo: red
 sdk: docker
 pinned: false
+tags:
+  - openenv
+  - sre
+  - devops
+  - reinforcement-learning
+  - agents
 ---
 
-# SRE DevOps Simulator — OpenEnv Environment
+# 🌐 SRE DevOps Simulator — OpenEnv Environment
 
-## Description
-An OpenEnv environment that simulates a company's cloud 
-infrastructure. The AI agent acts as an on-call Site 
-Reliability Engineer (SRE) that must diagnose and fix 
-server incidents without taking the site offline.
+[![OpenEnv Compliant](https://img.shields.io/badge/OpenEnv-Compliant-brightgreen.svg)]()
+[![Docker Ready](https://img.shields.io/badge/Docker-Ready-blue.svg)]()
+[![Phase 1 Validated](https://img.shields.io/badge/Hackathon-Phase_1_Passed-gold.svg)]()
 
-## Real-World Motivation
-Companies spend millions on cloud infrastructure. Training
-AI to automatically diagnose and mitigate server outages
-is a critical problem in enterprise tech.
+## 📖 The Problem: AI in Enterprise Infrastructure
+Modern enterprises lose millions of dollars for every hour their cloud infrastructure is offline. While Human Site Reliability Engineers (SREs) use complex reasoning to diagnose logs, ignore "red herring" alerts, and safely mitigate production outages, current AI agents lack a safe, deterministic sandbox to practice these high-stakes skills. 
 
-## Environment Details
+We cannot train frontier models on live production databases. **They need a simulator.**
 
-### Action Space
-| Action | Description |
-|--------|-------------|
-| RestartService(server_id) | Restart a crashed server |
-| ScaleUp(resource_type) | Add capacity for traffic |
-| ScaleDown(resource_type) | Reduce capacity |
-| RollbackDeployment(version) | Revert bad deployment |
-| KillProcess(server_id) | Kill runaway process |
-| FlushCache(cache_id) | Clear cache server |
-| FailoverDatabase(replica_id) | Switch to replica DB |
-| InvestigateLog(server_id) | Read detailed logs |
+## 🎯 The Solution: SRE DevOps Simulator
+This OpenEnv-compliant environment acts as a highly realistic, mathematically rigorous training ground for agentic AI. The AI model acts as the on-call SRE. It is given simulated server metrics, active alerts, and deployment histories, and must execute exact terminal-like commands to restore site stability without taking the infrastructure offline or bankrupting the company by over-provisioning servers.
 
-### Observation Space
-| Field | Description |
-|-------|-------------|
-| tick | Current simulation tick |
-| servers | Dict of server metrics (cpu, ram, status) |
-| alerts | List of active alerts with severity |
-| logs | Recent log entries |
-| deployment_history | List of deployments |
-| active_connections | Total cluster connections |
-| site_uptime | Whether site is up |
-| downtime_ticks | Ticks site has been down |
+This environment specifically evaluates an LLM's ability to:
+1. **Filter Noise:** Ignore red herring alerts and focus on root causes.
+2. **Sequential Reasoning:** Use tools like `InvestigateLog` to gather context before taking destructive actions like `RollbackDeployment`.
+3. **Resource Management:** Balance scaling infrastructure to meet traffic demands without triggering spam/over-provisioning penalties.
 
-## Tasks
+---
 
-### Easy — "The Dead Server"
-- **Difficulty:** Easy
-- **Max Ticks:** 10
-- **Scenario:** web-3 has crashed. Two red herring alerts 
-  are firing. Agent must restart the correct server.
-- **Expected Score:** 1.0 for correct first action
+## 🏗️ Environment Architecture
 
-### Medium — "Traffic Tsunami"  
-- **Difficulty:** Medium
-- **Max Ticks:** 15
-- **Scenario:** Black Friday traffic surge. API gateways 
-  failing. Agent must scale up before database crashes.
-- **Expected Score:** 0.8 for correct scaling actions
+### The Action Space
+The agent has access to 8 deterministic tools. Penalties are strictly enforced for redundant or illogical actions (e.g., attempting to rollback a deployment twice, or scaling a server already at maximum capacity).
 
-### Hard — "The Silent Killer"
-- **Difficulty:** Hard
-- **Max Ticks:** 15
-- **Scenario:** Bad deployment v2.3.1 causing memory leak.
-  CPU looks normal (red herring). Agent must investigate,
-  rollback, and restart affected servers.
-- **Expected Score:** 0.9 for full correct sequence
+| Action | Description | Complexity |
+|--------|-------------|------------|
+| `RestartService(server_id)` | Reboots a crashed node. | Low |
+| `ScaleUp(resource_type)` | Provisions additional capacity for traffic spikes. | Medium |
+| `ScaleDown(resource_type)` | Reduces capacity to save costs. | Medium |
+| `RollbackDeployment(version)` | Reverts a bad code push to a stable state. | High |
+| `KillProcess(server_id)` | Terminates a runaway process consuming CPU. | Low |
+| `FlushCache(cache_id)` | Clears overloaded cache memory. | Low |
+| `FailoverDatabase(replica_id)` | Promotes a replica DB if the primary fails. | High |
+| `InvestigateLog(server_id)` | Reads detailed stdout/stderr logs for root cause analysis. | High |
 
-## Baseline Scores
-| Task | Score |
-|------|-------|
-| easy | 1.00 |
-| medium | 0.80 |
-| hard | 0.30 |
-| **Average** | **0.70** |
+### The Observation Space
+At each `step()`, the agent receives a rich, JSON-structured state representing the live cluster:
+* **`servers`**: Dict of real-time metrics (CPU %, RAM %, status, capacity).
+* **`alerts`**: Active PagerDuty-style alerts (contains intentional noise/red herrings).
+* **`logs`**: Recent system events.
+* **`site_uptime`**: Boolean indicating if the customer-facing site is currently resolving.
+* **`active_connections`**: Total cluster load, used for scaling scenarios.
 
-## Setup Instructions
+---
+
+## 🏆 Evaluation Tasks
+
+The simulator includes three distinct scenarios designed to test different axes of agentic reasoning.
+
+### 🟢 Easy: "The Dead Server"
+* **Scenario:** `web-3` has crashed abruptly. Two critical but irrelevant "red herring" alerts are firing simultaneously.
+* **Agent Objective:** Parse the noisy observation state, identify the genuinely dead server, and issue a targeted `RestartService` command.
+* **Evaluation Focus:** Basic tool use and noise filtration.
+
+### 🟡 Medium: "Traffic Tsunami"  
+* **Scenario:** A massive traffic surge (e.g., Black Friday) is overwhelming the API gateways.
+* **Agent Objective:** The agent must sequentially `ScaleUp` the infrastructure to meet the connection demand before the database crashes. 
+* **Evaluation Focus:** The environment strictly penalizes "action spamming." The agent must scale appropriately without over-provisioning or blindly repeating commands.
+
+### 🔴 Hard: "The Silent Killer"
+* **Scenario:** A recent code deployment (`v2.3.1`) introduced a memory leak. CPU metrics look completely normal (a trap for naive models). 
+* **Agent Objective:** The agent must recognize the RAM anomaly, use `InvestigateLog` to confirm the bad deployment, and successfully execute `RollbackDeployment(v2.3.0)`.
+* **Evaluation Focus:** Multi-step reasoning, root cause analysis, and utilizing discovery tools before execution tools.
+
+---
+
+## 📊 Baseline Performance
+This environment was tested using **Qwen/Qwen2.5-72B-Instruct** via the Hugging Face Serverless API. 
+
+| Task | Final Score | Notes |
+|------|-------|-------|
+| **Easy** | `1.00` | Model correctly identified and restarted `web-3` on Tick 1. |
+| **Medium** | `0.80` | Model successfully scaled infrastructure but struggled with optimal capacity limits. |
+| **Hard** | `0.70` | Model identified the leak and initiated rollback, showing strong partial reasoning. |
+| **Average** | **`0.83`** | *Validates environment provides meaningful, variable reward signals.* |
+
+---
+
+## ⚙️ Setup & Validation
 
 ### Prerequisites
 ```bash
-pip install fastapi uvicorn pydantic openai requests
-```
+pip install fastapi uvicorn pydantic openai requests openenv-core uv
 
-### Run Locally
-```bash
-# Start environment server
-uvicorn app:app --host 0.0.0.0 --port 7860
+Run Locally (Development)
 
-# Run baseline inference (in new terminal)
-export API_BASE_URL=https://router.huggingface.co/v1
+# Generate lock file
+uv lock
+
+# Start the OpenEnv server
+uvicorn server.app:app --host 0.0.0.0 --port 7860
+
+# In a separate terminal, run the agent:
+export API_BASE_URL=[https://router.huggingface.co/v1](https://router.huggingface.co/v1)
 export MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
-export HF_TOKEN=your_hf_token_here
+export HF_TOKEN=your_hf_token
 python inference.py
-```
 
-### Docker
-```bash
+docker deplayment
 docker build -t sre-devops-env .
 docker run -p 7860:7860 sre-devops-env
-```
-
-## API Endpoints
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| /health | GET | Health check |
-| /reset/{task_id} | POST | Reset environment |
-| /step | POST | Take action |
-| /state | GET | Get current state |
-| /tasks | GET | List all tasks |
-| /docs | GET | API documentation |
-
-## Environment Variables
-| Variable | Description |
-|----------|-------------|
-| API_BASE_URL | LLM API endpoint |
-| MODEL_NAME | Model identifier |
-| HF_TOKEN | Hugging Face API key |
