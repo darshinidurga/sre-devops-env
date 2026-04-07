@@ -24,13 +24,23 @@ from openai import OpenAI
 # ── Configuration ──────────────────────────────────────────────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN     = os.getenv("HF_TOKEN",     "")
+
+# FIX 1: Safely handle missing HF_TOKEN to prevent OpenAI initialization crash
+HF_TOKEN     = os.getenv("HF_TOKEN", "")
+if not HF_TOKEN:
+    HF_TOKEN = "dummy_token_to_prevent_crash"
+
 ENV_URL      = os.getenv("ENV_URL",      "http://localhost:7860")
 BENCHMARK    = "sre-devops-env"
 MAX_STEPS    = 15
 SUCCESS_SCORE_THRESHOLD = 0.5
 
-client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+# FIX 2: Wrap client initialization in try/except
+try:
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+except Exception as e:
+    print(f"Warning: OpenAI client init failed: {e}")
+    client = None
 
 # ── Valid actions & smart defaults ─────────────────────────────────────────────
 VALID_ACTIONS = [
@@ -49,7 +59,6 @@ TASK_DEFAULTS = {
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
-
 def log_step(
     step: int,
     action: str,
@@ -65,7 +74,6 @@ def log_step(
         flush=True,
     )
 
-
 def log_end(
     success: bool,
     steps: int,
@@ -79,7 +87,6 @@ def log_end(
         flush=True,
     )
 
-
 # ── AI Action ──────────────────────────────────────────────────────────────────
 def get_ai_action(
     observation: dict,
@@ -91,32 +98,32 @@ def get_ai_action(
 
     servers = observation.get("servers", {})
     server_summary = "\n".join([
-        f"  {sid}: cpu={s['cpu']}% ram={s['ram']}% "
-        f"status={s['status']}"
+        f"  {sid}: cpu={s.get('cpu', 0)}% ram={s.get('ram', 0)}% "
+        f"status={s.get('status', 'unknown')}"
         for sid, s in servers.items()
     ])
 
     alerts = observation.get("alerts", [])
     alert_summary = "\n".join([
-        f"  [{a['severity'].upper()}] {a['server']}: {a['message']}"
+        f"  [{a.get('severity', 'INFO').upper()}] {a.get('server', 'unknown')}: {a.get('message', '')}"
         for a in alerts
     ]) or "  None"
 
     logs = observation.get("logs", [])[-5:]
     log_summary = "\n".join([
-        f"  {l['server']}: {l['message']}"
+        f"  {l.get('server', 'unknown')}: {l.get('message', '')}"
         for l in logs
     ]) or "  None"
 
     deployments = observation.get("deployment_history", [])
     deploy_summary = "\n".join([
-        f"  {d['version']} — {d['status']}"
+        f"  {d.get('version', 'unknown')} — {d.get('status', 'unknown')}"
         for d in deployments
     ]) or "  None"
 
     recent = action_log[-3:] if action_log else []
     recent_summary = "\n".join([
-        f"  {a['action_type']} → {a['target_id']}"
+        f"  {a.get('action_type', '')} → {a.get('target_id', '')}"
         for a in recent
     ]) or "  None yet"
 
@@ -142,7 +149,6 @@ DEPLOYMENT HISTORY:
 ACTIONS ALREADY TAKEN - DO NOT REPEAT:
 {recent_summary}
 
-STRICT RULES:
 STRICT RULES:
 1. NEVER repeat same action + target you already did
 2. target_id must NEVER be null or empty
@@ -173,29 +179,33 @@ AVAILABLE ACTIONS:
 Respond with ONLY a JSON object:
 {{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"}}"""
 
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=60,
-        temperature=0.1,
-    )
+    # FIX 3: Safe execution block for LLM calls
+    if client is None:
+        return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
 
-    text = response.choices[0].message.content.strip()
-    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-    if match:
-        try:
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=60,
+            temperature=0.1,
+            timeout=15 # Protects against network hangs
+        )
+        text = response.choices[0].message.content.strip()
+        match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+        
+        if match:
             parsed = json.loads(match.group())
             if parsed.get("action_type") not in VALID_ACTIONS:
-                return TASK_DEFAULTS[task_id]
+                return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
             if not parsed.get("target_id"):
-                parsed["target_id"] = "v2.3.0" \
-                    if parsed["action_type"] == "RollbackDeployment" \
-                    else "web-1"
+                parsed["target_id"] = "v2.3.0" if parsed.get("action_type") == "RollbackDeployment" else "web-1"
             return parsed
-        except json.JSONDecodeError:
-            return TASK_DEFAULTS[task_id]
-    return TASK_DEFAULTS[task_id]
-
+            
+    except Exception as e:
+        print(f"Warning: LLM generation failed: {e}")
+        
+    return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
 
 # ── Run Single Task ────────────────────────────────────────────────────────────
 def run_task(task_id: str) -> float:
@@ -210,11 +220,12 @@ def run_task(task_id: str) -> float:
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        # Reset environment
+        # FIX 4: Added raise_for_status() to catch 404s/500s cleanly
         response = requests.post(
             f"{ENV_URL}/reset/{task_id}",
             timeout=10
         )
+        response.raise_for_status() 
         obs = response.json()
 
         done = False
@@ -226,34 +237,33 @@ def run_task(task_id: str) -> float:
             steps_taken = step
             error_msg   = None
 
-            # Get AI action
+            # Get AI action safely
             try:
                 action = get_ai_action(obs, task_id, action_log)
             except Exception as e:
                 error_msg = str(e)[:80]
-                action    = TASK_DEFAULTS[task_id]
+                action    = TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
 
             # Fix null target
             if not action.get("target_id"):
-                action["target_id"] = "v2.3.0" \
-                    if action.get("action_type") == "RollbackDeployment" \
-                    else "web-1"
+                action["target_id"] = "v2.3.0" if action.get("action_type") == "RollbackDeployment" else "web-1"
 
             action_log.append(action)
-            action_str = f"{action['action_type']}({action['target_id']})"
+            action_str = f"{action.get('action_type', 'Unknown')}({action.get('target_id', 'Unknown')})"
 
-            # Send to environment
+            # Send to environment safely
             reward = 0.0
             try:
                 step_resp = requests.post(
                     f"{ENV_URL}/step",
                     json={
-                        "action_type": action["action_type"],
-                        "target_id":   action["target_id"],
+                        "action_type": action.get("action_type"),
+                        "target_id":   action.get("target_id"),
                         "parameters":  {}
                     },
                     timeout=10
                 )
+                step_resp.raise_for_status()
                 result     = step_resp.json()
                 obs        = result.get("observation", obs)
                 reward_obj = result.get("reward", {})
@@ -297,7 +307,6 @@ def run_task(task_id: str) -> float:
         )
 
     return score
-
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
