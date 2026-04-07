@@ -6,7 +6,7 @@ Baseline inference script for SRE DevOps OpenEnv environment.
 MANDATORY ENVIRONMENT VARIABLES:
     API_BASE_URL   The API endpoint for the LLM.
     MODEL_NAME     The model identifier to use for inference.
-    HF_TOKEN       Your Hugging Face / API key.
+    API_KEY        The evaluator's injected key (fallback to HF_TOKEN for local testing).
 
 STDOUT FORMAT:
     [START] task=<task_name> env=<benchmark> model=<model_name>
@@ -22,22 +22,25 @@ from typing import List, Optional
 from openai import OpenAI
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+ENV_URL      = os.environ.get("ENV_URL", "http://localhost:7860")
 
-# FIX 1: Safely handle missing HF_TOKEN to prevent OpenAI initialization crash
-HF_TOKEN     = os.getenv("HF_TOKEN", "")
-if not HF_TOKEN:
-    HF_TOKEN = "dummy_token_to_prevent_crash"
-
-ENV_URL      = os.getenv("ENV_URL",      "http://localhost:7860")
 BENCHMARK    = "sre-devops-env"
 MAX_STEPS    = 15
 SUCCESS_SCORE_THRESHOLD = 0.5
 
-# FIX 2: Wrap client initialization in try/except
+# FIX: Catch the grader's API_KEY to satisfy the proxy, fallback to HF_TOKEN, use dummy if blank
+EVALUATOR_TOKEN = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
+if not EVALUATOR_TOKEN:
+    EVALUATOR_TOKEN = "dummy_token_to_prevent_crash"
+
+# Initialize the OpenAI client EXACTLY as instructed, wrapped in safety
 try:
-    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+    client = OpenAI(
+        base_url=API_BASE_URL,
+        api_key=EVALUATOR_TOKEN
+    )
 except Exception as e:
     print(f"Warning: OpenAI client init failed: {e}")
     client = None
@@ -179,7 +182,7 @@ AVAILABLE ACTIONS:
 Respond with ONLY a JSON object:
 {{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"}}"""
 
-    # FIX 3: Safe execution block for LLM calls
+    # Safe execution block for LLM calls
     if client is None:
         return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
 
@@ -220,7 +223,7 @@ def run_task(task_id: str) -> float:
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        # FIX 4: Added raise_for_status() to catch 404s/500s cleanly
+        # Added raise_for_status() to catch 404s/500s cleanly
         response = requests.post(
             f"{ENV_URL}/reset/{task_id}",
             timeout=10
@@ -323,7 +326,7 @@ def main() -> None:
         print(f"Health: {r.json()}", flush=True)
     except Exception:
         print("ERROR: Environment not running!", flush=True)
-        print(f"Fix: uvicorn app:app --host 0.0.0.0 --port 7860", flush=True)
+        print("Fix: uvicorn server.app:app --host 0.0.0.0 --port 7860", flush=True)
         return
 
     # Run all 3 tasks
@@ -343,7 +346,6 @@ def main() -> None:
     print(f"\n  Average  | {avg:.4f}", flush=True)
     print("=" * 50, flush=True)
     print("Baseline inference complete ✅", flush=True)
-
 
 if __name__ == "__main__":
     main()
