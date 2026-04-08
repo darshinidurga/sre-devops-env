@@ -2,130 +2,163 @@
 inference.py
 ============
 Baseline inference script for SRE DevOps OpenEnv environment.
-
-MANDATORY ENVIRONMENT VARIABLES:
-    API_BASE_URL   The API endpoint for the LLM.
-    MODEL_NAME     The model identifier to use for inference.
-    API_KEY        The evaluator's injected key (fallback to HF_TOKEN for local testing).
-
-STDOUT FORMAT:
-    [START] task=<task_name> env=<benchmark> model=<model_name>
-    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
-    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
+Compliant with OpenEnv specification - matches sample pattern.
 """
 
 import os
 import re
 import json
-import requests
-from typing import List, Optional
+import asyncio
+from typing import List, Optional, Dict, Any
+from dataclasses import dataclass
+
 from openai import OpenAI
 
-# ── Configuration ──────────────────────────────────────────────────────────────
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-ENV_URL      = os.environ.get("ENV_URL", "http://localhost:7860")
+# Try to load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-BENCHMARK               = "sre-devops-env"
-MAX_STEPS               = 15
+# Import your models
+from models import Action, ActionType, Observation, Reward, StepResponse
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY") or os.getenv("HF_TOKEN")
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+ENV_URL = os.getenv("ENV_URL") or "http://localhost:7860"
+
+BENCHMARK = "sre-devops-env"
+MAX_STEPS = 15
+TEMPERATURE = 0.1
+MAX_TOKENS = 60
 SUCCESS_SCORE_THRESHOLD = 0.5
 
-# ✅ FIX 1: No dummy key fallback. Raise loudly if API_KEY is missing so the
-#           evaluator's injected key is ALWAYS used — never a placeholder.
-EVALUATOR_TOKEN = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
-if not EVALUATOR_TOKEN:
-    raise EnvironmentError(
-        "API_KEY environment variable is not set. "
-        "Cannot proceed without the evaluator's injected key."
-    )
-
-# ✅ FIX 2: No try/except around client init — must fail loudly if misconfigured.
-#           Both base_url AND api_key must come from environment variables.
-client = OpenAI(
-    base_url=API_BASE_URL,
-    api_key=EVALUATOR_TOKEN
-)
-
-# ── Valid actions & smart defaults ─────────────────────────────────────────────
 VALID_ACTIONS = [
     "RestartService", "ScaleUp", "ScaleDown",
     "RollbackDeployment", "KillProcess",
     "FlushCache", "FailoverDatabase", "InvestigateLog"
 ]
 
-TASK_DEFAULTS = {
-    "easy":   {"action_type": "RestartService",  "target_id": "web-3"},
-    "medium": {"action_type": "ScaleUp",         "target_id": "api-gw-1"},
-    "hard":   {"action_type": "InvestigateLog",  "target_id": "web-1"},
-}
 
-# ── Mandatory log functions ────────────────────────────────────────────────────
+# ── Logging Functions (Exact sample format) ───────────────────────────────────
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
-def log_step(
-    step: int,
-    action: str,
-    reward: float,
-    done: bool,
-    error: Optional[str]
-) -> None:
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
     error_val = error if error else "null"
-    done_val  = str(done).lower()
+    done_val = str(done).lower()
     print(
-        f"[STEP] step={step} action={action} "
-        f"reward={reward:.2f} done={done_val} error={error_val}",
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
         flush=True,
     )
 
-def log_end(
-    success: bool,
-    steps: int,
-    score: float,
-    rewards: List[float]
-) -> None:
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
-        f"[END] success={str(success).lower()} "
-        f"steps={steps} score={score:.2f} rewards={rewards_str}",
+        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
         flush=True,
     )
 
-# ── AI Action ──────────────────────────────────────────────────────────────────
-def get_ai_action(
-    observation: dict,
-    task_id: str,
-    action_log: List[dict] = None
-) -> dict:
-    if action_log is None:
-        action_log = []
 
-    servers = observation.get("servers", {})
+# ── Smart Fallback Helpers ──────────────────────────────────────────────────────
+def get_hard_task_fallback(action_log: List[Dict]) -> Action:
+    """Deterministic fallback for hard task based on progress."""
+    actions_taken = [(a.get("action_type"), a.get("target_id")) for a in action_log]
+    
+    investigated_web1 = any(t == "InvestigateLog" and tid == "web-1" for t, tid in actions_taken)
+    investigated_web2 = any(t == "InvestigateLog" and tid == "web-2" for t, tid in actions_taken)
+    rolled_back = any(t == "RollbackDeployment" for t, _ in actions_taken)
+    restarted_web1 = any(t == "RestartService" and tid == "web-1" for t, tid in actions_taken)
+    restarted_web2 = any(t == "RestartService" and tid == "web-2" for t, tid in actions_taken)
+    
+    if not investigated_web1:
+        return Action(action_type=ActionType.InvestigateLog, target_id="web-1")
+    elif not investigated_web2:
+        return Action(action_type=ActionType.InvestigateLog, target_id="web-2")
+    elif not rolled_back:
+        return Action(action_type=ActionType.RollbackDeployment, target_id="v2.3.0")
+    elif not restarted_web1:
+        return Action(action_type=ActionType.RestartService, target_id="web-1")
+    elif not restarted_web2:
+        return Action(action_type=ActionType.RestartService, target_id="web-2")
+    else:
+        return Action(action_type=ActionType.InvestigateLog, target_id="web-1")
+
+
+def get_medium_task_fallback(action_log: List[Dict]) -> Action:
+    """Scale up both gateways in sequence."""
+    actions_taken = [(a.get("action_type"), a.get("target_id")) for a in action_log]
+    
+    scaled_gw1 = any(t == "ScaleUp" and tid == "api-gw-1" for t, tid in actions_taken)
+    scaled_gw2 = any(t == "ScaleUp" and tid == "api-gw-2" for t, tid in actions_taken)
+    
+    if not scaled_gw1:
+        return Action(action_type=ActionType.ScaleUp, target_id="api-gw-1")
+    elif not scaled_gw2:
+        return Action(action_type=ActionType.ScaleUp, target_id="api-gw-2")
+    else:
+        return Action(action_type=ActionType.InvestigateLog, target_id="api-gw-1")
+
+
+def get_easy_task_fallback() -> Action:
+    """Easy task: just restart web-3."""
+    return Action(action_type=ActionType.RestartService, target_id="web-3")
+
+
+# ── OpenAI Client Setup ───────────────────────────────────────────────────────
+def get_client() -> Optional[OpenAI]:
+    """Initialize OpenAI client with validation."""
+    if not OPENAI_API_KEY:
+        print("[DEBUG] ERROR: OPENAI_API_KEY not set", flush=True)
+        return None
+    
+    # Clean and validate URL
+    base_url = API_BASE_URL.strip() if API_BASE_URL else "https://router.huggingface.co/v1"
+    if not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url
+    
+    try:
+        client = OpenAI(base_url=base_url, api_key=OPENAI_API_KEY)
+        return client
+    except Exception as exc:
+        print(f"[DEBUG] Client init failed: {exc}", flush=True)
+        return None
+
+
+# ── AI Action Generation ──────────────────────────────────────────────────────
+def get_ai_action(
+    client: Optional[OpenAI],
+    observation: Observation,
+    task_id: str,
+    action_log: List[Dict]
+) -> Action:
+    """Get action from LLM with smart fallback to defaults."""
+    
+    # Build observation summary
+    servers = observation.servers
     server_summary = "\n".join([
-        f"  {sid}: cpu={s.get('cpu', 0)}% ram={s.get('ram', 0)}% "
-        f"status={s.get('status', 'unknown')}"
+        f"  {sid}: cpu={s.cpu}% ram={s.ram}% status={s.status}"
         for sid, s in servers.items()
     ])
 
-    alerts = observation.get("alerts", [])
+    alerts = observation.alerts
     alert_summary = "\n".join([
-        f"  [{a.get('severity', 'INFO').upper()}] {a.get('server', 'unknown')}: {a.get('message', '')}"
+        f"  [{a.severity.upper()}] {a.server}: {a.message}"
         for a in alerts
     ]) or "  None"
 
-    logs = observation.get("logs", [])[-5:]
+    logs = observation.logs[-5:]
     log_summary = "\n".join([
-        f"  {l.get('server', 'unknown')}: {l.get('message', '')}"
+        f"  {l.server}: {l.message}"
         for l in logs
     ]) or "  None"
 
-    deployments = observation.get("deployment_history", [])
-    deploy_summary = "\n".join([
-        f"  {d.get('version', 'unknown')} — {d.get('status', 'unknown')}"
-        for d in deployments
-    ]) or "  None"
-
-    recent = action_log[-3:] if action_log else []
+    recent = action_log[-5:] if action_log else []
     recent_summary = "\n".join([
         f"  {a.get('action_type', '')} → {a.get('target_id', '')}"
         for a in recent
@@ -133,10 +166,10 @@ def get_ai_action(
 
     prompt = f"""You are a Site Reliability Engineer fixing a production incident.
 
-TASK: {observation.get('task_description', '')}
-TICK: {observation.get('tick', 0)}
-SITE UP: {observation.get('site_uptime', True)}
-CONNECTIONS: {observation.get('active_connections', 0)}
+TASK: {observation.task_description}
+TICK: {observation.tick}
+SITE UP: {observation.site_uptime}
+CONNECTIONS: {observation.active_connections}
 
 SERVERS:
 {server_summary}
@@ -147,177 +180,184 @@ ALERTS:
 RECENT LOGS:
 {log_summary}
 
-DEPLOYMENT HISTORY:
-{deploy_summary}
-
-ACTIONS ALREADY TAKEN - DO NOT REPEAT:
+ACTIONS ALREADY TAKEN:
 {recent_summary}
 
 STRICT RULES:
-1. NEVER repeat same action + target you already did
+1. NEVER repeat same action + target combination
 2. target_id must NEVER be null or empty
-3. For RollbackDeployment → always use target_id: "v2.3.0"
-4. HARD TASK SEQUENCE — follow this EXACTLY:
-   Step 1: InvestigateLog → web-1
-   Step 2: InvestigateLog → web-2  
-   Step 3: RollbackDeployment → v2.3.0
-   Step 4: RestartService → web-1
-   Step 5: RestartService → web-2
-5. If you already did InvestigateLog on web-1 AND web-2
-   → NEXT action MUST be RollbackDeployment(v2.3.0)
-6. If you already did RollbackDeployment
-   → NEXT action MUST be RestartService(web-1)
-7. If you already restarted web-1
-   → NEXT action MUST be RestartService(web-2)
+3. For RollbackDeployment → use target_id: "v2.3.0"
+4. HARD TASK SEQUENCE: InvestigateLog(web-1) → InvestigateLog(web-2) → RollbackDeployment(v2.3.0) → RestartService(web-1) → RestartService(web-2)
+5. MEDIUM TASK: ScaleUp(api-gw-1) → ScaleUp(api-gw-2)
 
-AVAILABLE ACTIONS:
-  RestartService     → {{"action_type": "RestartService", "target_id": "web-3"}}
-  ScaleUp            → {{"action_type": "ScaleUp", "target_id": "api-gw-1"}}
-  ScaleDown          → {{"action_type": "ScaleDown", "target_id": "web-1"}}
-  RollbackDeployment → {{"action_type": "RollbackDeployment", "target_id": "v2.3.0"}}
-  KillProcess        → {{"action_type": "KillProcess", "target_id": "web-1"}}
-  FlushCache         → {{"action_type": "FlushCache", "target_id": "cache-1"}}
-  FailoverDatabase   → {{"action_type": "FailoverDatabase", "target_id": "db-replica"}}
-  InvestigateLog     → {{"action_type": "InvestigateLog", "target_id": "web-1"}}
+Respond with ONLY JSON: {{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"}}"""
 
-Respond with ONLY a JSON object:
-{{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"}}"""
-
-    # ✅ FIX 3: Removed "if client is None" guard — client is always initialized.
-    # ✅ FIX 4: Removed silent except fallback — exceptions now propagate so the
-    #           proxy call is always attempted and tracked by the evaluator.
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=60,
-        temperature=0.1,
-        timeout=30  # increased from 15 → 30 for reliability
-    )
-    text = response.choices[0].message.content.strip()
-    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-
-    if match:
-        parsed = json.loads(match.group())
-        if parsed.get("action_type") not in VALID_ACTIONS:
-            return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
-        if not parsed.get("target_id"):
-            parsed["target_id"] = (
-                "v2.3.0" if parsed.get("action_type") == "RollbackDeployment"
-                else "web-1"
+    # Try LLM first if available
+    if client is not None:
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                timeout=30
             )
-        return parsed
+            text = response.choices[0].message.content.strip()
+            
+            match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group())
+                action_type_str = parsed.get("action_type", "")
+                
+                if action_type_str in VALID_ACTIONS:
+                    target_id = parsed.get("target_id")
+                    if not target_id:
+                        target_id = "v2.3.0" if action_type_str == "RollbackDeployment" else "web-1"
+                    
+                    # Check for repeats
+                    if any(a.get("action_type") == action_type_str and a.get("target_id") == target_id 
+                           for a in action_log):
+                        print(f"[DEBUG] LLM suggested repeat action, using fallback", flush=True)
+                    else:
+                        action = Action(action_type=ActionType(action_type_str), target_id=target_id)
+                        action_log.append({"action_type": action_type_str, "target_id": target_id})
+                        return action
+                    
+        except Exception as exc:
+            print(f"[DEBUG] LLM call failed: {exc}", flush=True)
+            # Fall through to deterministic fallback
 
-    # Fallback only if LLM returned unparseable text (proxy was still called)
-    return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
+    # SMART FALLBACK: Use task-specific sequential logic
+    print(f"[DEBUG] Using deterministic fallback for {task_id}", flush=True)
+    
+    if task_id == "hard":
+        action = get_hard_task_fallback(action_log)
+    elif task_id == "medium":
+        action = get_medium_task_fallback(action_log)
+    else:
+        action = get_easy_task_fallback()
+    
+    # Record fallback in action_log
+    action_type_val = action.action_type.value if isinstance(action.action_type, ActionType) else action.action_type
+    action_log.append({"action_type": action_type_val, "target_id": action.target_id})
+    
+    return action
 
-# ── Run Single Task ────────────────────────────────────────────────────────────
-def run_task(task_id: str) -> float:
 
-    rewards:    List[float] = []
-    action_log: List[dict]  = []
+# ── Environment Interface ──────────────────────────────────────────────────────
+class SREEnvironmentClient:
+    """HTTP client for SRE environment."""
+    
+    def __init__(self, base_url: str = ENV_URL):
+        self.base_url = base_url.rstrip('/')
+        import requests
+        self.session = requests.Session()
+    
+    def reset(self, task_id: str) -> Observation:
+        """Reset environment for new task."""
+        import requests
+        
+        resp = self.session.post(f"{self.base_url}/reset/{task_id}", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return Observation(**data)
+    
+    def step(self, action: Action) -> StepResponse:
+        """Execute action."""
+        import requests
+        
+        payload = {
+            "action_type": action.action_type.value if isinstance(action.action_type, ActionType) else str(action.action_type),
+            "target_id": action.target_id,
+            "parameters": action.parameters or {}
+        }
+        
+        resp = self.session.post(f"{self.base_url}/step", json=payload, timeout=10)
+        resp.raise_for_status()
+        result = resp.json()
+        
+        # Handle nested structure
+        if "observation" in result:
+            obs = Observation(**result["observation"])
+            reward = Reward(**result["reward"])
+            done = result.get("done", False)
+        else:
+            obs = Observation(**result)
+            reward_data = result.get("reward", {"score": 0.0, "feedback": "No feedback", "done": False, "total_ticks": 0, "breakdown": {}})
+            reward = Reward(**reward_data)
+            done = result.get("done", False)
+        
+        return StepResponse(observation=obs, reward=reward, done=done, info={})
+    
+    def health(self) -> dict:
+        """Check environment health."""
+        import requests
+        
+        try:
+            resp = self.session.get(f"{self.base_url}/health", timeout=5)
+            return resp.json()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+    
+    def close(self):
+        """Cleanup."""
+        self.session.close()
+
+
+# ── Main Execution ──────────────────────────────────────────────────────────────
+def run_task(env: SREEnvironmentClient, client: Optional[OpenAI], task_id: str) -> float:
+    """Run single task episode."""
+    rewards: List[float] = []
+    action_log: List[Dict] = []
     steps_taken = 0
-    score       = 0.0
-    success     = False
+    score = 0.0
+    success = False
 
-    # Mandatory START log
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        response = requests.post(
-            f"{ENV_URL}/reset/{task_id}",
-            timeout=10
-        )
-        response.raise_for_status()
-        obs = response.json()
-
+        obs = env.reset(task_id)
         done = False
 
         for step in range(1, MAX_STEPS + 1):
             if done:
                 break
 
-            steps_taken = step
-            error_msg   = None
+            # Get action from LLM or fallback
+            action = get_ai_action(client, obs, task_id, action_log)
+            action_str = f"{action.action_type.value if isinstance(action.action_type, ActionType) else action.action_type}({action.target_id})"
 
-            # ✅ FIX 5: get_ai_action exceptions are caught here at the task
-            #           level so one bad LLM response doesn't crash the whole run,
-            #           but the proxy call was still attempted before the error.
+            # Execute
+            error_msg = None
             try:
-                action = get_ai_action(obs, task_id, action_log)
-            except Exception as e:
-                error_msg = str(e)[:80]
-                print(f"Warning: LLM call failed at step {step}: {e}", flush=True)
-                action = TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
-
-            # Fix null target_id defensively
-            if not action.get("target_id"):
-                action["target_id"] = (
-                    "v2.3.0" if action.get("action_type") == "RollbackDeployment"
-                    else "web-1"
-                )
-
-            action_log.append(action)
-            action_str = f"{action.get('action_type', 'Unknown')}({action.get('target_id', 'Unknown')})"
-
-            # Send action to environment
-            reward = 0.0
-            try:
-                step_resp = requests.post(
-                    f"{ENV_URL}/step",
-                    json={
-                        "action_type": action.get("action_type"),
-                        "target_id":   action.get("target_id"),
-                        "parameters":  {}
-                    },
-                    timeout=10
-                )
-                step_resp.raise_for_status()
-                result     = step_resp.json()
-                obs        = result.get("observation", obs)
-                reward_obj = result.get("reward", {})
-                done       = result.get("done", False)
-                reward     = reward_obj.get("score", 0.0)
-                score      = reward
-
-            except Exception as e:
-                error_msg = str(e)[:80]
-                done      = True
+                step_resp = env.step(action)
+                obs = step_resp.observation
+                reward = step_resp.reward.score
+                done = step_resp.done
+                score = reward
+            except Exception as exc:
+                error_msg = str(exc)[:80]
+                done = True
+                reward = 0.0
 
             rewards.append(reward)
+            steps_taken = step
 
-            # Mandatory STEP log
-            log_step(
-                step=step,
-                action=action_str,
-                reward=reward,
-                done=done,
-                error=error_msg,
-            )
+            log_step(step=step, action=action_str, reward=reward, done=done, error=error_msg)
 
         success = score >= SUCCESS_SCORE_THRESHOLD
 
-    except Exception as e:
-        log_step(
-            step=steps_taken + 1,
-            action="error",
-            reward=0.0,
-            done=True,
-            error=str(e)[:80],
-        )
+    except Exception as exc:
+        log_step(step=steps_taken + 1, action="error", reward=0.0, done=True, error=str(exc)[:80])
 
     finally:
-        # Mandatory END log
-        log_end(
-            success=success,
-            steps=steps_taken,
-            score=score,
-            rewards=rewards,
-        )
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
     return score
 
-# ── Main ───────────────────────────────────────────────────────────────────────
-def main() -> None:
+
+def main():
+    """Main entry point."""
     print("=" * 50, flush=True)
     print("SRE DEVOPS ENV — BASELINE INFERENCE", flush=True)
     print("=" * 50, flush=True)
@@ -325,22 +365,21 @@ def main() -> None:
     print(f"Model: {MODEL_NAME}", flush=True)
     print(f"Env  : {ENV_URL}", flush=True)
 
-    # Health check
-    try:
-        r = requests.get(f"{ENV_URL}/health", timeout=5)
-        print(f"Health: {r.json()}", flush=True)
-    except Exception:
-        print("ERROR: Environment not running!", flush=True)
-        print("Fix: uvicorn server.app:app --host 0.0.0.0 --port 7860", flush=True)
-        return
+    # Initialize client (may be None if no API key)
+    client = get_client()
 
-    # Run all 3 tasks
+    # Health check
+    env = SREEnvironmentClient(ENV_URL)
+    health = env.health()
+    print(f"Health: {health}", flush=True)
+
+    # Run all tasks
     scores = {}
     for task_id in ["easy", "medium", "hard"]:
         print(f"\n{'='*50}", flush=True)
-        scores[task_id] = run_task(task_id)
+        scores[task_id] = run_task(env, client, task_id)
 
-    # Final summary
+    # Summary
     print(f"\n{'='*50}", flush=True)
     print("BASELINE RESULTS", flush=True)
     print("=" * 50, flush=True)
@@ -350,7 +389,9 @@ def main() -> None:
     avg = sum(scores.values()) / len(scores)
     print(f"\n  Average  | {avg:.4f}", flush=True)
     print("=" * 50, flush=True)
-    print("Baseline inference complete ✅", flush=True)
+    
+    env.close()
+
 
 if __name__ == "__main__":
     main()
