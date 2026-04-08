@@ -3,10 +3,10 @@ inference.py
 ============
 Baseline inference script for SRE DevOps OpenEnv environment.
 
-MANDATORY ENVIRONMENT VARIABLES:
-    API_BASE_URL   The API endpoint for the LLM.
+MANDATORY ENVIRONMENT VARIABLES (injected by evaluator at runtime):
+    API_BASE_URL   The LiteLLM proxy endpoint.
+    API_KEY        The evaluator's injected proxy key.
     MODEL_NAME     The model identifier to use for inference.
-    API_KEY        The evaluator's injected key (fallback to HF_TOKEN for local testing).
 
 STDOUT FORMAT:
     [START] task=<task_name> env=<benchmark> model=<model_name>
@@ -22,28 +22,30 @@ from typing import List, Optional
 from openai import OpenAI
 
 # ── Configuration ──────────────────────────────────────────────────────────────
+# Read at module level for logging only.
+# Actual values used in API calls are re-read inside get_client()
+# so evaluator-injected env vars are always picked up at call time.
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-ENV_URL      = os.environ.get("ENV_URL", "http://localhost:7860")
+MODEL_NAME   = os.environ.get("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
+ENV_URL      = os.environ.get("ENV_URL",      "http://localhost:7860")
 
-BENCHMARK    = "sre-devops-env"
-MAX_STEPS    = 15
+BENCHMARK               = "sre-devops-env"
+MAX_STEPS               = 15
 SUCCESS_SCORE_THRESHOLD = 0.5
 
-# FIX: Catch the grader's API_KEY to satisfy the proxy, fallback to HF_TOKEN, use dummy if blank
-EVALUATOR_TOKEN = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
-if not EVALUATOR_TOKEN:
-    EVALUATOR_TOKEN = "dummy_token_to_prevent_crash"
+# ── Lazy OpenAI client ─────────────────────────────────────────────────────────
+# Created on FIRST USE, not at import time.
+# This prevents httpx from crashing if API_BASE_URL is empty at startup
+# but gets injected by the evaluator before the first actual API call.
+_client: Optional[OpenAI] = None
 
-# Initialize the OpenAI client EXACTLY as instructed, wrapped in safety
-try:
-    client = OpenAI(
-        base_url=API_BASE_URL,
-        api_key=EVALUATOR_TOKEN
-    )
-except Exception as e:
-    print(f"Warning: OpenAI client init failed: {e}")
-    client = None
+def get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        base_url = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+        api_key  = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN", "dummy-key")
+        _client  = OpenAI(base_url=base_url, api_key=api_key)
+    return _client
 
 # ── Valid actions & smart defaults ─────────────────────────────────────────────
 VALID_ACTIONS = [
@@ -53,9 +55,9 @@ VALID_ACTIONS = [
 ]
 
 TASK_DEFAULTS = {
-    "easy":   {"action_type": "RestartService",     "target_id": "web-3"},
-    "medium": {"action_type": "ScaleUp",            "target_id": "api-gw-1"},
-    "hard":   {"action_type": "InvestigateLog",     "target_id": "web-1"},
+    "easy":   {"action_type": "RestartService",  "target_id": "web-3"},
+    "medium": {"action_type": "ScaleUp",         "target_id": "api-gw-1"},
+    "hard":   {"action_type": "InvestigateLog",  "target_id": "web-1"},
 }
 
 # ── Mandatory log functions ────────────────────────────────────────────────────
@@ -158,7 +160,7 @@ STRICT RULES:
 3. For RollbackDeployment → always use target_id: "v2.3.0"
 4. HARD TASK SEQUENCE — follow this EXACTLY:
    Step 1: InvestigateLog → web-1
-   Step 2: InvestigateLog → web-2  
+   Step 2: InvestigateLog → web-2
    Step 3: RollbackDeployment → v2.3.0
    Step 4: RestartService → web-1
    Step 5: RestartService → web-2
@@ -182,32 +184,33 @@ AVAILABLE ACTIONS:
 Respond with ONLY a JSON object:
 {{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"}}"""
 
-    # Safe execution block for LLM calls
-    if client is None:
-        return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
+    # Re-read MODEL_NAME fresh from env in case evaluator injected it
+    model = os.environ.get("MODEL_NAME", MODEL_NAME)
 
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=60,
-            temperature=0.1,
-            timeout=15 # Protects against network hangs
-        )
-        text = response.choices[0].message.content.strip()
-        match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-        
-        if match:
-            parsed = json.loads(match.group())
-            if parsed.get("action_type") not in VALID_ACTIONS:
-                return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
-            if not parsed.get("target_id"):
-                parsed["target_id"] = "v2.3.0" if parsed.get("action_type") == "RollbackDeployment" else "web-1"
-            return parsed
-            
-    except Exception as e:
-        print(f"Warning: LLM generation failed: {e}")
-        
+    # Use lazy client — reads API_BASE_URL + API_KEY at first call time
+    # guaranteeing evaluator-injected values are always used
+    response = get_client().chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=60,
+        temperature=0.1,
+        timeout=30
+    )
+    text  = response.choices[0].message.content.strip()
+    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+
+    if match:
+        parsed = json.loads(match.group())
+        if parsed.get("action_type") not in VALID_ACTIONS:
+            return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
+        if not parsed.get("target_id"):
+            parsed["target_id"] = (
+                "v2.3.0" if parsed.get("action_type") == "RollbackDeployment"
+                else "web-1"
+            )
+        return parsed
+
+    # Fallback only when LLM returns unparseable text (proxy was still called)
     return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
 
 # ── Run Single Task ────────────────────────────────────────────────────────────
@@ -219,18 +222,15 @@ def run_task(task_id: str) -> float:
     score       = 0.0
     success     = False
 
-    # Mandatory START log
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        # Added raise_for_status() to catch 404s/500s cleanly
         response = requests.post(
             f"{ENV_URL}/reset/{task_id}",
             timeout=10
         )
-        response.raise_for_status() 
-        obs = response.json()
-
+        response.raise_for_status()
+        obs  = response.json()
         done = False
 
         for step in range(1, MAX_STEPS + 1):
@@ -240,21 +240,26 @@ def run_task(task_id: str) -> float:
             steps_taken = step
             error_msg   = None
 
-            # Get AI action safely
             try:
                 action = get_ai_action(obs, task_id, action_log)
             except Exception as e:
                 error_msg = str(e)[:80]
-                action    = TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
+                print(f"Warning: LLM call failed at step {step}: {e}", flush=True)
+                action = TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
 
-            # Fix null target
+            # Defensive null target fix
             if not action.get("target_id"):
-                action["target_id"] = "v2.3.0" if action.get("action_type") == "RollbackDeployment" else "web-1"
+                action["target_id"] = (
+                    "v2.3.0" if action.get("action_type") == "RollbackDeployment"
+                    else "web-1"
+                )
 
             action_log.append(action)
-            action_str = f"{action.get('action_type', 'Unknown')}({action.get('target_id', 'Unknown')})"
+            action_str = (
+                f"{action.get('action_type', 'Unknown')}"
+                f"({action.get('target_id', 'Unknown')})"
+            )
 
-            # Send to environment safely
             reward = 0.0
             try:
                 step_resp = requests.post(
@@ -279,35 +284,18 @@ def run_task(task_id: str) -> float:
                 done      = True
 
             rewards.append(reward)
-
-            # Mandatory STEP log
-            log_step(
-                step=step,
-                action=action_str,
-                reward=reward,
-                done=done,
-                error=error_msg,
-            )
+            log_step(step=step, action=action_str, reward=reward,
+                     done=done, error=error_msg)
 
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as e:
-        log_step(
-            step=steps_taken + 1,
-            action="error",
-            reward=0.0,
-            done=True,
-            error=str(e)[:80],
-        )
+        log_step(step=steps_taken + 1, action="error",
+                 reward=0.0, done=True, error=str(e)[:80])
 
     finally:
-        # Mandatory END log
-        log_end(
-            success=success,
-            steps=steps_taken,
-            score=score,
-            rewards=rewards,
-        )
+        log_end(success=success, steps=steps_taken,
+                score=score, rewards=rewards)
 
     return score
 
@@ -316,8 +304,8 @@ def main() -> None:
     print("=" * 50, flush=True)
     print("SRE DEVOPS ENV — BASELINE INFERENCE", flush=True)
     print("=" * 50, flush=True)
-    print(f"API  : {API_BASE_URL}", flush=True)
-    print(f"Model: {MODEL_NAME}", flush=True)
+    print(f"API  : {os.environ.get('API_BASE_URL', API_BASE_URL)}", flush=True)
+    print(f"Model: {os.environ.get('MODEL_NAME',   MODEL_NAME)}",   flush=True)
     print(f"Env  : {ENV_URL}", flush=True)
 
     # Health check
