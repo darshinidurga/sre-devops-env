@@ -2,33 +2,28 @@
 inference.py
 ============
 Baseline inference script for SRE DevOps OpenEnv environment.
-Compliant with OpenEnv specification - matches sample pattern.
+MUST use evaluator's API_BASE_URL and API_KEY environment variables.
 """
 
 import os
 import re
 import json
-import asyncio
 from typing import List, Optional, Dict, Any
-from dataclasses import dataclass
 
 from openai import OpenAI
 
-# Try to load .env file if python-dotenv is available
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-# Import your models
 from models import Action, ActionType, Observation, Reward, StepResponse
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY") or os.getenv("HF_TOKEN")
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
-MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
-ENV_URL = os.getenv("ENV_URL") or "http://localhost:7860"
+# ✅ CRITICAL: Use EXACTLY the variable names the evaluator injects
+API_BASE_URL = os.environ.get("API_BASE_URL")  # Evaluator provides this
+API_KEY = os.environ.get("API_KEY")            # Evaluator provides this (primary)
+MODEL_NAME = os.environ.get("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+ENV_URL = os.environ.get("ENV_URL") or "http://localhost:7860"
+
+# Fallback for API_KEY only if not provided (local testing)
+if not API_KEY:
+    API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or "local-test-key"
 
 BENCHMARK = "sre-devops-env"
 MAX_STEPS = 15
@@ -43,7 +38,7 @@ VALID_ACTIONS = [
 ]
 
 
-# ── Logging Functions (Exact sample format) ───────────────────────────────────
+# ── Logging Functions ───────────────────────────────────────────────────────────
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
@@ -65,9 +60,35 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     )
 
 
+# ── OpenAI Client Setup ─────────────────────────────────────────────────────────
+def get_client() -> Optional[OpenAI]:
+    """Initialize OpenAI client with evaluator's credentials."""
+    # Clean and validate URL
+    base_url = API_BASE_URL
+    if not base_url:
+        base_url = "https://router.huggingface.co/v1"
+    base_url = base_url.strip()
+    
+    if not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url
+    
+    # Ensure we have some key
+    api_key = API_KEY
+    if not api_key:
+        print("[DEBUG] No API key available", flush=True)
+        return None
+    
+    try:
+        client = OpenAI(base_url=base_url, api_key=api_key)
+        return client
+    except Exception as exc:
+        print(f"[DEBUG] Client init failed: {exc}", flush=True)
+        return None
+
+
 # ── Smart Fallback Helpers ──────────────────────────────────────────────────────
 def get_hard_task_fallback(action_log: List[Dict]) -> Action:
-    """Deterministic fallback for hard task based on progress."""
+    """Deterministic fallback for hard task."""
     actions_taken = [(a.get("action_type"), a.get("target_id")) for a in action_log]
     
     investigated_web1 = any(t == "InvestigateLog" and tid == "web-1" for t, tid in actions_taken)
@@ -110,34 +131,14 @@ def get_easy_task_fallback() -> Action:
     return Action(action_type=ActionType.RestartService, target_id="web-3")
 
 
-# ── OpenAI Client Setup ───────────────────────────────────────────────────────
-def get_client() -> Optional[OpenAI]:
-    """Initialize OpenAI client with validation."""
-    if not OPENAI_API_KEY:
-        print("[DEBUG] ERROR: OPENAI_API_KEY not set", flush=True)
-        return None
-    
-    # Clean and validate URL
-    base_url = API_BASE_URL.strip() if API_BASE_URL else "https://router.huggingface.co/v1"
-    if not base_url.startswith(("http://", "https://")):
-        base_url = "https://" + base_url
-    
-    try:
-        client = OpenAI(base_url=base_url, api_key=OPENAI_API_KEY)
-        return client
-    except Exception as exc:
-        print(f"[DEBUG] Client init failed: {exc}", flush=True)
-        return None
-
-
-# ── AI Action Generation ──────────────────────────────────────────────────────
+# ── AI Action Generation ────────────────────────────────────────────────────────
 def get_ai_action(
     client: Optional[OpenAI],
     observation: Observation,
     task_id: str,
     action_log: List[Dict]
 ) -> Action:
-    """Get action from LLM with smart fallback to defaults."""
+    """Get action from LLM with fallback to defaults."""
     
     # Build observation summary
     servers = observation.servers
@@ -192,7 +193,7 @@ STRICT RULES:
 
 Respond with ONLY JSON: {{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"}}"""
 
-    # Try LLM first if available
+    # ✅ CRITICAL: Always try LLM first if client exists
     if client is not None:
         try:
             response = client.chat.completions.create(
@@ -215,19 +216,18 @@ Respond with ONLY JSON: {{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"
                         target_id = "v2.3.0" if action_type_str == "RollbackDeployment" else "web-1"
                     
                     # Check for repeats
-                    if any(a.get("action_type") == action_type_str and a.get("target_id") == target_id 
-                           for a in action_log):
-                        print(f"[DEBUG] LLM suggested repeat action, using fallback", flush=True)
-                    else:
+                    is_repeat = any(a.get("action_type") == action_type_str and a.get("target_id") == target_id 
+                                   for a in action_log)
+                    
+                    if not is_repeat:
                         action = Action(action_type=ActionType(action_type_str), target_id=target_id)
                         action_log.append({"action_type": action_type_str, "target_id": target_id})
-                        return action
+                        return action  # ✅ Used LLM successfully
                     
         except Exception as exc:
             print(f"[DEBUG] LLM call failed: {exc}", flush=True)
-            # Fall through to deterministic fallback
 
-    # SMART FALLBACK: Use task-specific sequential logic
+    # Fallback only when LLM failed or returned invalid response
     print(f"[DEBUG] Using deterministic fallback for {task_id}", flush=True)
     
     if task_id == "hard":
@@ -237,14 +237,13 @@ Respond with ONLY JSON: {{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"
     else:
         action = get_easy_task_fallback()
     
-    # Record fallback in action_log
     action_type_val = action.action_type.value if isinstance(action.action_type, ActionType) else action.action_type
     action_log.append({"action_type": action_type_val, "target_id": action.target_id})
     
     return action
 
 
-# ── Environment Interface ──────────────────────────────────────────────────────
+# ── Environment Interface ────────────────────────────────────────────────────────
 class SREEnvironmentClient:
     """HTTP client for SRE environment."""
     
@@ -254,16 +253,12 @@ class SREEnvironmentClient:
         self.session = requests.Session()
     
     def reset(self, task_id: str) -> Observation:
-        """Reset environment for new task."""
         import requests
-        
         resp = self.session.post(f"{self.base_url}/reset/{task_id}", timeout=10)
         resp.raise_for_status()
-        data = resp.json()
-        return Observation(**data)
+        return Observation(**resp.json())
     
     def step(self, action: Action) -> StepResponse:
-        """Execute action."""
         import requests
         
         payload = {
@@ -276,7 +271,6 @@ class SREEnvironmentClient:
         resp.raise_for_status()
         result = resp.json()
         
-        # Handle nested structure
         if "observation" in result:
             obs = Observation(**result["observation"])
             reward = Reward(**result["reward"])
@@ -290,9 +284,7 @@ class SREEnvironmentClient:
         return StepResponse(observation=obs, reward=reward, done=done, info={})
     
     def health(self) -> dict:
-        """Check environment health."""
         import requests
-        
         try:
             resp = self.session.get(f"{self.base_url}/health", timeout=5)
             return resp.json()
@@ -300,11 +292,10 @@ class SREEnvironmentClient:
             return {"status": "error", "message": str(e)}
     
     def close(self):
-        """Cleanup."""
         self.session.close()
 
 
-# ── Main Execution ──────────────────────────────────────────────────────────────
+# ── Main Execution ───────────────────────────────────────────────────────────────
 def run_task(env: SREEnvironmentClient, client: Optional[OpenAI], task_id: str) -> float:
     """Run single task episode."""
     rewards: List[float] = []
@@ -323,11 +314,9 @@ def run_task(env: SREEnvironmentClient, client: Optional[OpenAI], task_id: str) 
             if done:
                 break
 
-            # Get action from LLM or fallback
             action = get_ai_action(client, obs, task_id, action_log)
             action_str = f"{action.action_type.value if isinstance(action.action_type, ActionType) else action.action_type}({action.target_id})"
 
-            # Execute
             error_msg = None
             try:
                 step_resp = env.step(action)
@@ -342,7 +331,6 @@ def run_task(env: SREEnvironmentClient, client: Optional[OpenAI], task_id: str) 
 
             rewards.append(reward)
             steps_taken = step
-
             log_step(step=step, action=action_str, reward=reward, done=done, error=error_msg)
 
         success = score >= SUCCESS_SCORE_THRESHOLD
@@ -365,10 +353,9 @@ def main():
     print(f"Model: {MODEL_NAME}", flush=True)
     print(f"Env  : {ENV_URL}", flush=True)
 
-    # Initialize client (may be None if no API key)
+    # Initialize client - will use evaluator's injected credentials
     client = get_client()
 
-    # Health check
     env = SREEnvironmentClient(ENV_URL)
     health = env.health()
     print(f"Health: {health}", flush=True)
