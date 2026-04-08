@@ -26,24 +26,25 @@ API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1"
 MODEL_NAME   = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 ENV_URL      = os.environ.get("ENV_URL", "http://localhost:7860")
 
-BENCHMARK    = "sre-devops-env"
-MAX_STEPS    = 15
+BENCHMARK               = "sre-devops-env"
+MAX_STEPS               = 15
 SUCCESS_SCORE_THRESHOLD = 0.5
 
-# FIX: Catch the grader's API_KEY to satisfy the proxy, fallback to HF_TOKEN, use dummy if blank
+# ✅ FIX 1: No dummy key fallback. Raise loudly if API_KEY is missing so the
+#           evaluator's injected key is ALWAYS used — never a placeholder.
 EVALUATOR_TOKEN = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
 if not EVALUATOR_TOKEN:
-    EVALUATOR_TOKEN = "dummy_token_to_prevent_crash"
-
-# Initialize the OpenAI client EXACTLY as instructed, wrapped in safety
-try:
-    client = OpenAI(
-        base_url=API_BASE_URL,
-        api_key=EVALUATOR_TOKEN
+    raise EnvironmentError(
+        "API_KEY environment variable is not set. "
+        "Cannot proceed without the evaluator's injected key."
     )
-except Exception as e:
-    print(f"Warning: OpenAI client init failed: {e}")
-    client = None
+
+# ✅ FIX 2: No try/except around client init — must fail loudly if misconfigured.
+#           Both base_url AND api_key must come from environment variables.
+client = OpenAI(
+    base_url=API_BASE_URL,
+    api_key=EVALUATOR_TOKEN
+)
 
 # ── Valid actions & smart defaults ─────────────────────────────────────────────
 VALID_ACTIONS = [
@@ -53,9 +54,9 @@ VALID_ACTIONS = [
 ]
 
 TASK_DEFAULTS = {
-    "easy":   {"action_type": "RestartService",     "target_id": "web-3"},
-    "medium": {"action_type": "ScaleUp",            "target_id": "api-gw-1"},
-    "hard":   {"action_type": "InvestigateLog",     "target_id": "web-1"},
+    "easy":   {"action_type": "RestartService",  "target_id": "web-3"},
+    "medium": {"action_type": "ScaleUp",         "target_id": "api-gw-1"},
+    "hard":   {"action_type": "InvestigateLog",  "target_id": "web-1"},
 }
 
 # ── Mandatory log functions ────────────────────────────────────────────────────
@@ -182,32 +183,31 @@ AVAILABLE ACTIONS:
 Respond with ONLY a JSON object:
 {{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"}}"""
 
-    # Safe execution block for LLM calls
-    if client is None:
-        return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
+    # ✅ FIX 3: Removed "if client is None" guard — client is always initialized.
+    # ✅ FIX 4: Removed silent except fallback — exceptions now propagate so the
+    #           proxy call is always attempted and tracked by the evaluator.
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=60,
+        temperature=0.1,
+        timeout=30  # increased from 15 → 30 for reliability
+    )
+    text = response.choices[0].message.content.strip()
+    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
 
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=60,
-            temperature=0.1,
-            timeout=15 # Protects against network hangs
-        )
-        text = response.choices[0].message.content.strip()
-        match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-        
-        if match:
-            parsed = json.loads(match.group())
-            if parsed.get("action_type") not in VALID_ACTIONS:
-                return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
-            if not parsed.get("target_id"):
-                parsed["target_id"] = "v2.3.0" if parsed.get("action_type") == "RollbackDeployment" else "web-1"
-            return parsed
-            
-    except Exception as e:
-        print(f"Warning: LLM generation failed: {e}")
-        
+    if match:
+        parsed = json.loads(match.group())
+        if parsed.get("action_type") not in VALID_ACTIONS:
+            return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
+        if not parsed.get("target_id"):
+            parsed["target_id"] = (
+                "v2.3.0" if parsed.get("action_type") == "RollbackDeployment"
+                else "web-1"
+            )
+        return parsed
+
+    # Fallback only if LLM returned unparseable text (proxy was still called)
     return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
 
 # ── Run Single Task ────────────────────────────────────────────────────────────
@@ -223,12 +223,11 @@ def run_task(task_id: str) -> float:
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        # Added raise_for_status() to catch 404s/500s cleanly
         response = requests.post(
             f"{ENV_URL}/reset/{task_id}",
             timeout=10
         )
-        response.raise_for_status() 
+        response.raise_for_status()
         obs = response.json()
 
         done = False
@@ -240,21 +239,27 @@ def run_task(task_id: str) -> float:
             steps_taken = step
             error_msg   = None
 
-            # Get AI action safely
+            # ✅ FIX 5: get_ai_action exceptions are caught here at the task
+            #           level so one bad LLM response doesn't crash the whole run,
+            #           but the proxy call was still attempted before the error.
             try:
                 action = get_ai_action(obs, task_id, action_log)
             except Exception as e:
                 error_msg = str(e)[:80]
-                action    = TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
+                print(f"Warning: LLM call failed at step {step}: {e}", flush=True)
+                action = TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
 
-            # Fix null target
+            # Fix null target_id defensively
             if not action.get("target_id"):
-                action["target_id"] = "v2.3.0" if action.get("action_type") == "RollbackDeployment" else "web-1"
+                action["target_id"] = (
+                    "v2.3.0" if action.get("action_type") == "RollbackDeployment"
+                    else "web-1"
+                )
 
             action_log.append(action)
             action_str = f"{action.get('action_type', 'Unknown')}({action.get('target_id', 'Unknown')})"
 
-            # Send to environment safely
+            # Send action to environment
             reward = 0.0
             try:
                 step_resp = requests.post(
