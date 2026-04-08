@@ -3,7 +3,7 @@ inference.py
 ============
 Baseline inference script for SRE DevOps OpenEnv environment.
 
-MANDATORY ENVIRONMENT VARIABLES (injected by evaluator at runtime):
+MANDATORY ENVIRONMENT VARIABLES:
     API_BASE_URL   The LiteLLM proxy endpoint.
     API_KEY        The evaluator's injected proxy key.
     MODEL_NAME     The model identifier to use for inference.
@@ -22,30 +22,16 @@ from typing import List, Optional
 from openai import OpenAI
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-# Read at module level for logging only.
-# Actual values used in API calls are re-read inside get_client()
-# so evaluator-injected env vars are always picked up at call time.
+# We read the keys exactly as the sample script does.
+# API_KEY is checked first for the grader, HF_TOKEN as fallback for your local testing.
+API_KEY      = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN", "dummy-key")
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.environ.get("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
-ENV_URL      = os.environ.get("ENV_URL",      "http://localhost:7860")
+MODEL_NAME   = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+ENV_URL      = os.environ.get("ENV_URL", "http://localhost:7860")
 
 BENCHMARK               = "sre-devops-env"
 MAX_STEPS               = 15
 SUCCESS_SCORE_THRESHOLD = 0.5
-
-# ── Lazy OpenAI client ─────────────────────────────────────────────────────────
-# Created on FIRST USE, not at import time.
-# This prevents httpx from crashing if API_BASE_URL is empty at startup
-# but gets injected by the evaluator before the first actual API call.
-_client: Optional[OpenAI] = None
-
-def get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        base_url = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-        api_key  = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN", "dummy-key")
-        _client  = OpenAI(base_url=base_url, api_key=api_key)
-    return _client
 
 # ── Valid actions & smart defaults ─────────────────────────────────────────────
 VALID_ACTIONS = [
@@ -93,7 +79,9 @@ def log_end(
     )
 
 # ── AI Action ──────────────────────────────────────────────────────────────────
+# NOTE: We pass 'client' directly into this function, exactly like the sample script does
 def get_ai_action(
+    client: OpenAI,
     observation: dict,
     task_id: str,
     action_log: List[dict] = None
@@ -164,12 +152,6 @@ STRICT RULES:
    Step 3: RollbackDeployment → v2.3.0
    Step 4: RestartService → web-1
    Step 5: RestartService → web-2
-5. If you already did InvestigateLog on web-1 AND web-2
-   → NEXT action MUST be RollbackDeployment(v2.3.0)
-6. If you already did RollbackDeployment
-   → NEXT action MUST be RestartService(web-1)
-7. If you already restarted web-1
-   → NEXT action MUST be RestartService(web-2)
 
 AVAILABLE ACTIONS:
   RestartService     → {{"action_type": "RestartService", "target_id": "web-3"}}
@@ -184,37 +166,35 @@ AVAILABLE ACTIONS:
 Respond with ONLY a JSON object:
 {{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"}}"""
 
-    # Re-read MODEL_NAME fresh from env in case evaluator injected it
-    model = os.environ.get("MODEL_NAME", MODEL_NAME)
+    # We use a try/except HERE (exactly like the sample script does) just for the network call
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=60,
+            temperature=0.1,
+            timeout=30
+        )
+        text  = response.choices[0].message.content.strip()
+        match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
 
-    # Use lazy client — reads API_BASE_URL + API_KEY at first call time
-    # guaranteeing evaluator-injected values are always used
-    response = get_client().chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=60,
-        temperature=0.1,
-        timeout=30
-    )
-    text  = response.choices[0].message.content.strip()
-    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+        if match:
+            parsed = json.loads(match.group())
+            if parsed.get("action_type") not in VALID_ACTIONS:
+                return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
+            if not parsed.get("target_id"):
+                parsed["target_id"] = (
+                    "v2.3.0" if parsed.get("action_type") == "RollbackDeployment"
+                    else "web-1"
+                )
+            return parsed
+    except Exception as exc:
+        print(f"[DEBUG] Model request failed: {exc}", flush=True)
 
-    if match:
-        parsed = json.loads(match.group())
-        if parsed.get("action_type") not in VALID_ACTIONS:
-            return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
-        if not parsed.get("target_id"):
-            parsed["target_id"] = (
-                "v2.3.0" if parsed.get("action_type") == "RollbackDeployment"
-                else "web-1"
-            )
-        return parsed
-
-    # Fallback only when LLM returns unparseable text (proxy was still called)
     return TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
 
 # ── Run Single Task ────────────────────────────────────────────────────────────
-def run_task(task_id: str) -> float:
+def run_task(client: OpenAI, task_id: str) -> float:
 
     rewards:    List[float] = []
     action_log: List[dict]  = []
@@ -240,12 +220,8 @@ def run_task(task_id: str) -> float:
             steps_taken = step
             error_msg   = None
 
-            try:
-                action = get_ai_action(obs, task_id, action_log)
-            except Exception as e:
-                error_msg = str(e)[:80]
-                print(f"Warning: LLM call failed at step {step}: {e}", flush=True)
-                action = TASK_DEFAULTS.get(task_id, TASK_DEFAULTS["easy"])
+            # Pass the client into the action function
+            action = get_ai_action(client, obs, task_id, action_log)
 
             # Defensive null target fix
             if not action.get("target_id"):
@@ -304,9 +280,12 @@ def main() -> None:
     print("=" * 50, flush=True)
     print("SRE DEVOPS ENV — BASELINE INFERENCE", flush=True)
     print("=" * 50, flush=True)
-    print(f"API  : {os.environ.get('API_BASE_URL', API_BASE_URL)}", flush=True)
-    print(f"Model: {os.environ.get('MODEL_NAME',   MODEL_NAME)}",   flush=True)
+    print(f"API  : {API_BASE_URL}", flush=True)
+    print(f"Model: {MODEL_NAME}", flush=True)
     print(f"Env  : {ENV_URL}", flush=True)
+
+    # EXACT MATCH TO SAMPLE: Initialize the client INSIDE main()
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     # Health check
     try:
@@ -317,11 +296,11 @@ def main() -> None:
         print("Fix: uvicorn server.app:app --host 0.0.0.0 --port 7860", flush=True)
         return
 
-    # Run all 3 tasks
+    # Run all 3 tasks, passing the correctly initialized client
     scores = {}
     for task_id in ["easy", "medium", "hard"]:
         print(f"\n{'='*50}", flush=True)
-        scores[task_id] = run_task(task_id)
+        scores[task_id] = run_task(client, task_id)
 
     # Final summary
     print(f"\n{'='*50}", flush=True)
