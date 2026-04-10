@@ -10,6 +10,7 @@ STDOUT FORMAT:
 """
 
 import os
+import sys
 import re
 import json
 import requests
@@ -18,19 +19,15 @@ from typing import List, Optional, Dict, Any
 from openai import OpenAI
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-# ✅ CRITICAL: Use EXACTLY what evaluator injects - no fallback if not set.
-# Using os.environ for mandatory keys, os.getenv for optional keys.
-# We try our best to support both the official sample's fallback and strictly injected vars.
-try:
-    API_KEY = os.environ["API_KEY"]
-except KeyError:
-    API_KEY = os.getenv("HF_TOKEN", "")
+# ✅ CRITICAL: HF_TOKEN is primary (evaluator sets this), API_KEY is fallback
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 
-try:
-    API_BASE_URL = os.environ["API_BASE_URL"]
-except KeyError:
-    API_BASE_URL = "https://router.huggingface.co/v1"
+# ✅ CRITICAL: Check API_KEY exists before proceeding
+if not API_KEY:
+    print("ERROR: HF_TOKEN or API_KEY environment variable must be set", flush=True)
+    sys.exit(1)
 
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 ENV_URL = os.getenv("ENV_URL", "http://localhost:7860")
 
@@ -316,7 +313,8 @@ def main() -> None:
     print(f"Model: {MODEL_NAME}", flush=True)
     print(f"Env  : {ENV_URL}", flush=True)
 
-    # ✅ CRITICAL: Initialize client with evaluator's EXACT credentials
+    # ✅ CRITICAL: Initialize client with evaluator's credentials
+    # API_KEY was already validated at module level
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     try:
