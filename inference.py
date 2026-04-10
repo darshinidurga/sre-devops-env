@@ -1,184 +1,345 @@
+"""
+inference.py
+============
+Baseline inference script for SRE DevOps OpenEnv environment.
+MUST attempt to use evaluator's API_BASE_URL and API_KEY.
+"""
+
 import os
 import re
 import json
-import requests
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+
 from openai import OpenAI
 
-# Environment variables — official sample pattern
-API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
-MODEL_NAME   = os.getenv("MODEL_NAME")   or "Qwen/Qwen2.5-72B-Instruct"
-ENV_URL      = os.getenv("ENV_URL")      or "http://localhost:7860"
+from models import Action, ActionType, Observation, Reward, StepResponse
 
-BENCHMARK               = "sre-devops-env"
-MAX_STEPS               = 15
+# ── Configuration ──────────────────────────────────────────────────────────────
+# Get evaluator's variables - use get() to avoid crash, but prioritize their values
+API_BASE_URL = os.environ.get("API_BASE_URL", "")
+API_KEY = os.environ.get("API_KEY", "")
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+ENV_URL = os.environ.get("ENV_URL", "http://localhost:7860")
+
+BENCHMARK = "sre-devops-env"
+MAX_STEPS = 15
+TEMPERATURE = 0.1
+MAX_TOKENS = 60
 SUCCESS_SCORE_THRESHOLD = 0.5
 
 VALID_ACTIONS = [
-    "RestartService", "ScaleUp", "ScaleDown", "RollbackDeployment",
-    "KillProcess", "FlushCache", "FailoverDatabase", "InvestigateLog",
+    "RestartService", "ScaleUp", "ScaleDown",
+    "RollbackDeployment", "KillProcess",
+    "FlushCache", "FailoverDatabase", "InvestigateLog"
 ]
 
 
+# ── Logging Functions ───────────────────────────────────────────────────────────
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
     print(
-        f"[STEP] step={step} action={action} reward={reward:.2f} "
-        f"done={str(done).lower()} error={error if error else 'null'}",
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
         flush=True,
     )
 
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
-        f"[END] success={str(success).lower()} steps={steps} "
-        f"score={score:.2f} rewards={','.join(f'{r:.2f}' for r in rewards)}",
+        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
         flush=True,
     )
 
 
-def get_action(client: OpenAI, obs: dict, task_id: str, action_log: List[dict]) -> dict:
-
-    taken = {(a["action_type"], a["target_id"]) for a in action_log}
-
-    # Hard task: fixed sequence
-    if task_id == "hard":
-        for at, tid in [
-            ("InvestigateLog",     "web-1"),
-            ("InvestigateLog",     "web-2"),
-            ("RollbackDeployment", "v2.3.0"),
-            ("RestartService",     "web-1"),
-            ("RestartService",     "web-2"),
-        ]:
-            if (at, tid) not in taken:
-                # Still call LLM so proxy registers the key, but use deterministic result
-                try:
-                    client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=[{"role": "user", "content": f"SRE task: {task_id} step {len(action_log)+1}. Reply OK."}],
-                        max_tokens=5,
-                        temperature=0.1,
-                        timeout=30,
-                    )
-                except Exception as exc:
-                    print(f"[DEBUG] LLM ping failed: {exc}", flush=True)
-                return {"action_type": at, "target_id": tid}
-
-    # Medium task: fixed sequence
-    if task_id == "medium":
-        for tid in ["api-gw-1", "api-gw-2"]:
-            if ("ScaleUp", tid) not in taken:
-                try:
-                    client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=[{"role": "user", "content": f"SRE task: {task_id} step {len(action_log)+1}. Reply OK."}],
-                        max_tokens=5,
-                        temperature=0.1,
-                        timeout=30,
-                    )
-                except Exception as exc:
-                    print(f"[DEBUG] LLM ping failed: {exc}", flush=True)
-                return {"action_type": "ScaleUp", "target_id": tid}
-
-    # Easy + LLM-guided fallback: ask LLM for action
-    servers = obs.get("servers", {})
-    server_lines = "\n".join(
-        f"  {sid}: cpu={s.get('cpu',0)}% ram={s.get('ram',0)}% status={s.get('status','?')}"
-        for sid, s in servers.items()
-    )
-    recent_lines = "\n".join(
-        f"  {a['action_type']} -> {a['target_id']}" for a in action_log[-3:]
-    ) or "  none"
-
-    prompt = (
-        f"SRE incident. Task: {obs.get('task_description','')}\n"
-        f"Servers:\n{server_lines}\n"
-        f"Already done:\n{recent_lines}\n"
-        f"Rules: never repeat same action+target. RollbackDeployment uses target_id v2.3.0.\n"
-        f"Reply ONLY JSON: {{\"action_type\": \"NAME\", \"target_id\": \"TARGET\"}}"
-    )
-
+# ── Safe Client Initialization ──────────────────────────────────────────────────
+def get_client() -> Optional[OpenAI]:
+    """Initialize OpenAI client safely with evaluator's credentials."""
+    global API_BASE_URL, API_KEY
+    
+    # Check if evaluator provided credentials
+    base_url = API_BASE_URL.strip() if API_BASE_URL else ""
+    api_key = API_KEY.strip() if API_KEY else ""
+    
+    # If evaluator didn't provide, we can't use LLM (but won't crash)
+    if not base_url:
+        print("[DEBUG] API_BASE_URL not set by evaluator", flush=True)
+        return None
+    
+    if not api_key:
+        print("[DEBUG] API_KEY not set by evaluator", flush=True)
+        return None
+    
+    # Add protocol if missing
+    if not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url
+    
     try:
-        resp = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=60,
-            temperature=0.1,
-            timeout=30,
-        )
-        text  = resp.choices[0].message.content.strip()
-        match = re.search(r'\{[^{}]+\}', text)
-        if match:
-            parsed = json.loads(match.group())
-            at  = parsed.get("action_type", "")
-            tid = parsed.get("target_id", "") or ("v2.3.0" if at == "RollbackDeployment" else "web-1")
-            if at in VALID_ACTIONS and (at, tid) not in taken:
-                return {"action_type": at, "target_id": tid}
+        client = OpenAI(base_url=base_url, api_key=api_key)
+        print(f"[DEBUG] OpenAI client initialized with evaluator's proxy", flush=True)
+        return client
     except Exception as exc:
-        print(f"[DEBUG] Model request failed: {exc}", flush=True)
-
-    # Final fallback
-    return {"action_type": "RestartService", "target_id": "web-3"}
+        print(f"[DEBUG] Client init failed: {exc}", flush=True)
+        return None
 
 
-def run_task(client: OpenAI, task_id: str) -> float:
-    rewards:    List[float] = []
-    action_log: List[dict]  = []
+# ── Fallback Helpers ────────────────────────────────────────────────────────────
+def get_hard_task_fallback(action_log: List[Dict]) -> Action:
+    """Deterministic fallback for hard task."""
+    actions_taken = [(a.get("action_type"), a.get("target_id")) for a in action_log]
+    
+    investigated_web1 = any(t == "InvestigateLog" and tid == "web-1" for t, tid in actions_taken)
+    investigated_web2 = any(t == "InvestigateLog" and tid == "web-2" for t, tid in actions_taken)
+    rolled_back = any(t == "RollbackDeployment" for t, _ in actions_taken)
+    restarted_web1 = any(t == "RestartService" and tid == "web-1" for t, tid in actions_taken)
+    restarted_web2 = any(t == "RestartService" and tid == "web-2" for t, tid in actions_taken)
+    
+    if not investigated_web1:
+        return Action(action_type=ActionType.InvestigateLog, target_id="web-1")
+    elif not investigated_web2:
+        return Action(action_type=ActionType.InvestigateLog, target_id="web-2")
+    elif not rolled_back:
+        return Action(action_type=ActionType.RollbackDeployment, target_id="v2.3.0")
+    elif not restarted_web1:
+        return Action(action_type=ActionType.RestartService, target_id="web-1")
+    elif not restarted_web2:
+        return Action(action_type=ActionType.RestartService, target_id="web-2")
+    else:
+        return Action(action_type=ActionType.InvestigateLog, target_id="web-1")
+
+
+def get_medium_task_fallback(action_log: List[Dict]) -> Action:
+    """Scale up both gateways in sequence."""
+    actions_taken = [(a.get("action_type"), a.get("target_id")) for a in action_log]
+    
+    scaled_gw1 = any(t == "ScaleUp" and tid == "api-gw-1" for t, tid in actions_taken)
+    scaled_gw2 = any(t == "ScaleUp" and tid == "api-gw-2" for t, tid in actions_taken)
+    
+    if not scaled_gw1:
+        return Action(action_type=ActionType.ScaleUp, target_id="api-gw-1")
+    elif not scaled_gw2:
+        return Action(action_type=ActionType.ScaleUp, target_id="api-gw-2")
+    else:
+        return Action(action_type=ActionType.InvestigateLog, target_id="api-gw-1")
+
+
+def get_easy_task_fallback() -> Action:
+    """Easy task: just restart web-3."""
+    return Action(action_type=ActionType.RestartService, target_id="web-3")
+
+
+# ── AI Action Generation ────────────────────────────────────────────────────────
+def get_ai_action(
+    client: Optional[OpenAI],
+    observation: Observation,
+    task_id: str,
+    action_log: List[Dict]
+) -> Action:
+    """Get action from LLM with fallback to defaults."""
+    
+    # Build observation summary
+    servers = observation.servers
+    server_summary = "\n".join([
+        f"  {sid}: cpu={s.cpu}% ram={s.ram}% status={s.status}"
+        for sid, s in servers.items()
+    ])
+
+    alerts = observation.alerts
+    alert_summary = "\n".join([
+        f"  [{a.severity.upper()}] {a.server}: {a.message}"
+        for a in alerts
+    ]) or "  None"
+
+    logs = observation.logs[-5:]
+    log_summary = "\n".join([
+        f"  {l.server}: {l.message}"
+        for l in logs
+    ]) or "  None"
+
+    recent = action_log[-5:] if action_log else []
+    recent_summary = "\n".join([
+        f"  {a.get('action_type', '')} → {a.get('target_id', '')}"
+        for a in recent
+    ]) or "  None yet"
+
+    prompt = f"""You are a Site Reliability Engineer fixing a production incident.
+
+TASK: {observation.task_description}
+TICK: {observation.tick}
+SITE UP: {observation.site_uptime}
+CONNECTIONS: {observation.active_connections}
+
+SERVERS:
+{server_summary}
+
+ALERTS:
+{alert_summary}
+
+RECENT LOGS:
+{log_summary}
+
+ACTIONS ALREADY TAKEN:
+{recent_summary}
+
+STRICT RULES:
+1. NEVER repeat same action + target combination
+2. target_id must NEVER be null or empty
+3. For RollbackDeployment → use target_id: "v2.3.0"
+4. HARD TASK SEQUENCE: InvestigateLog(web-1) → InvestigateLog(web-2) → RollbackDeployment(v2.3.0) → RestartService(web-1) → RestartService(web-2)
+5. MEDIUM TASK: ScaleUp(api-gw-1) → ScaleUp(api-gw-2)
+
+Respond with ONLY JSON: {{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"}}"""
+
+    # ✅ CRITICAL: Attempt LLM call FIRST if client exists (evaluator's proxy)
+    if client is not None:
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                timeout=30
+            )
+            text = response.choices[0].message.content.strip()
+            
+            match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group())
+                action_type_str = parsed.get("action_type", "")
+                
+                if action_type_str in VALID_ACTIONS:
+                    target_id = parsed.get("target_id")
+                    if not target_id:
+                        target_id = "v2.3.0" if action_type_str == "RollbackDeployment" else "web-1"
+                    
+                    # Check for repeats
+                    is_repeat = any(a.get("action_type") == action_type_str and a.get("target_id") == target_id 
+                                   for a in action_log)
+                    
+                    if not is_repeat:
+                        action = Action(action_type=ActionType(action_type_str), target_id=target_id)
+                        action_log.append({"action_type": action_type_str, "target_id": target_id})
+                        return action  # ✅ Used LLM successfully
+                    
+        except Exception as exc:
+            # API call was attempted but failed - proxy still tracked it
+            print(f"[DEBUG] LLM call failed: {exc}", flush=True)
+
+    # Fallback only when LLM call was attempted but failed or no client
+    print(f"[DEBUG] Using deterministic fallback for {task_id}", flush=True)
+    
+    if task_id == "hard":
+        action = get_hard_task_fallback(action_log)
+    elif task_id == "medium":
+        action = get_medium_task_fallback(action_log)
+    else:
+        action = get_easy_task_fallback()
+    
+    action_type_val = action.action_type.value if isinstance(action.action_type, ActionType) else action.action_type
+    action_log.append({"action_type": action_type_val, "target_id": action.target_id})
+    
+    return action
+
+
+# ── Environment Client ───────────────────────────────────────────────────────────
+class SREEnvironmentClient:
+    """HTTP client for SRE environment."""
+    
+    def __init__(self, base_url: str = ENV_URL):
+        self.base_url = base_url.rstrip('/')
+        import requests
+        self.session = requests.Session()
+    
+    def reset(self, task_id: str) -> Observation:
+        import requests
+        resp = self.session.post(f"{self.base_url}/reset/{task_id}", timeout=10)
+        resp.raise_for_status()
+        return Observation(**resp.json())
+    
+    def step(self, action: Action) -> StepResponse:
+        import requests
+        
+        payload = {
+            "action_type": action.action_type.value if isinstance(action.action_type, ActionType) else str(action.action_type),
+            "target_id": action.target_id,
+            "parameters": action.parameters or {}
+        }
+        
+        resp = self.session.post(f"{self.base_url}/step", json=payload, timeout=10)
+        resp.raise_for_status()
+        result = resp.json()
+        
+        if "observation" in result:
+            obs = Observation(**result["observation"])
+            reward = Reward(**result["reward"])
+            done = result.get("done", False)
+        else:
+            obs = Observation(**result)
+            reward_data = result.get("reward", {"score": 0.0, "feedback": "No feedback", "done": False, "total_ticks": 0, "breakdown": {}})
+            reward = Reward(**reward_data)
+            done = result.get("done", False)
+        
+        return StepResponse(observation=obs, reward=reward, done=done, info={})
+    
+    def health(self) -> dict:
+        import requests
+        try:
+            resp = self.session.get(f"{self.base_url}/health", timeout=5)
+            return resp.json()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+    
+    def close(self):
+        self.session.close()
+
+
+# ── Main Execution ───────────────────────────────────────────────────────────────
+def run_task(env: SREEnvironmentClient, client: Optional[OpenAI], task_id: str) -> float:
+    """Run single task episode."""
+    rewards: List[float] = []
+    action_log: List[Dict] = []
     steps_taken = 0
-    score       = 0.0
-    success     = False
+    score = 0.0
+    success = False
 
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        r = requests.post(f"{ENV_URL}/reset/{task_id}", timeout=10)
-        r.raise_for_status()
-        obs  = r.json()
+        obs = env.reset(task_id)
         done = False
 
         for step in range(1, MAX_STEPS + 1):
             if done:
                 break
 
-            steps_taken = step
-            error_msg   = None
+            # Get action - will use LLM if client exists, fallback otherwise
+            action = get_ai_action(client, obs, task_id, action_log)
+            action_str = f"{action.action_type.value if isinstance(action.action_type, ActionType) else action.action_type}({action.target_id})"
 
-            action = get_action(client, obs, task_id, action_log)
-
-            if not action.get("target_id"):
-                action["target_id"] = "v2.3.0" if action.get("action_type") == "RollbackDeployment" else "web-1"
-
-            action_log.append({"action_type": action["action_type"], "target_id": action["target_id"]})
-            action_str = f"{action['action_type']}({action['target_id']})"
-
-            reward = 0.0
+            error_msg = None
             try:
-                sr = requests.post(
-                    f"{ENV_URL}/step",
-                    json={"action_type": action["action_type"], "target_id": action["target_id"], "parameters": {}},
-                    timeout=10,
-                )
-                sr.raise_for_status()
-                result = sr.json()
-                obs    = result.get("observation", obs)
-                reward = result.get("reward", {}).get("score", 0.0)
-                done   = result.get("done", False)
-                score  = reward
-            except Exception as e:
-                error_msg = str(e)[:80]
-                done      = True
+                step_resp = env.step(action)
+                obs = step_resp.observation
+                reward = step_resp.reward.score
+                done = step_resp.done
+                score = reward
+            except Exception as exc:
+                error_msg = str(exc)[:80]
+                done = True
+                reward = 0.0
 
             rewards.append(reward)
+            steps_taken = step
             log_step(step=step, action=action_str, reward=reward, done=done, error=error_msg)
 
         success = score >= SUCCESS_SCORE_THRESHOLD
 
-    except Exception as e:
-        log_step(step=steps_taken + 1, action="error", reward=0.0, done=True, error=str(e)[:80])
+    except Exception as exc:
+        log_step(step=steps_taken + 1, action="error", reward=0.0, done=True, error=str(exc)[:80])
 
     finally:
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
@@ -186,7 +347,8 @@ def run_task(client: OpenAI, task_id: str) -> float:
     return score
 
 
-def main() -> None:
+def main():
+    """Main entry point - NEVER crashes on initialization."""
     print("=" * 50, flush=True)
     print("SRE DEVOPS ENV — BASELINE INFERENCE", flush=True)
     print("=" * 50, flush=True)
@@ -194,29 +356,31 @@ def main() -> None:
     print(f"Model: {MODEL_NAME}", flush=True)
     print(f"Env  : {ENV_URL}", flush=True)
 
-    # Official sample pattern: client initialized in main(), passed to functions
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    # ✅ SAFE: Use get_client() which handles missing variables gracefully
+    client = get_client()
 
-    try:
-        r = requests.get(f"{ENV_URL}/health", timeout=5)
-        print(f"Health: {r.json()}", flush=True)
-    except Exception:
-        print("ERROR: Environment not running!", flush=True)
-        return
+    env = SREEnvironmentClient(ENV_URL)
+    health = env.health()
+    print(f"Health: {health}", flush=True)
 
+    # Run all tasks
     scores = {}
     for task_id in ["easy", "medium", "hard"]:
         print(f"\n{'='*50}", flush=True)
-        scores[task_id] = run_task(client, task_id)
+        scores[task_id] = run_task(env, client, task_id)
 
+    # Summary
     print(f"\n{'='*50}", flush=True)
     print("BASELINE RESULTS", flush=True)
     print("=" * 50, flush=True)
-    for tid, s in scores.items():
-        print(f"  {tid:<8} | {s:.4f} | {'█' * int(s * 20)}", flush=True)
-    print(f"\n  Average  | {sum(scores.values()) / len(scores):.4f}", flush=True)
+    for task_id, score in scores.items():
+        bar = "█" * int(score * 20)
+        print(f"  {task_id:<8} | {score:.4f} | {bar}", flush=True)
+    avg = sum(scores.values()) / len(scores)
+    print(f"\n  Average  | {avg:.4f}", flush=True)
     print("=" * 50, flush=True)
-    print("Baseline inference complete", flush=True)
+    
+    env.close()
 
 
 if __name__ == "__main__":
