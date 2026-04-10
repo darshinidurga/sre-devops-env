@@ -2,7 +2,7 @@
 inference.py
 ============
 Baseline inference script for SRE DevOps OpenEnv environment.
-MUST attempt to use evaluator's API_BASE_URL and API_KEY.
+MUST use evaluator's API_BASE_URL and API_KEY exactly as injected.
 """
 
 import os
@@ -15,7 +15,7 @@ from openai import OpenAI
 from models import Action, ActionType, Observation, Reward, StepResponse
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-# Get evaluator's variables - use get() to avoid crash, but prioritize their values
+# ✅ CRITICAL: Use EXACTLY what evaluator injects - NO FALLBACKS, NO MODIFICATIONS!
 API_BASE_URL = os.environ.get("API_BASE_URL", "")
 API_KEY = os.environ.get("API_KEY", "")
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
@@ -54,37 +54,6 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
         f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
         flush=True,
     )
-
-
-# ── Safe Client Initialization ──────────────────────────────────────────────────
-def get_client() -> Optional[OpenAI]:
-    """Initialize OpenAI client safely with evaluator's credentials."""
-    global API_BASE_URL, API_KEY
-    
-    # Check if evaluator provided credentials
-    base_url = API_BASE_URL.strip() if API_BASE_URL else ""
-    api_key = API_KEY.strip() if API_KEY else ""
-    
-    # If evaluator didn't provide, we can't use LLM (but won't crash)
-    if not base_url:
-        print("[DEBUG] API_BASE_URL not set by evaluator", flush=True)
-        return None
-    
-    if not api_key:
-        print("[DEBUG] API_KEY not set by evaluator", flush=True)
-        return None
-    
-    # Add protocol if missing
-    if not base_url.startswith(("http://", "https://")):
-        base_url = "https://" + base_url
-    
-    try:
-        client = OpenAI(base_url=base_url, api_key=api_key)
-        print(f"[DEBUG] OpenAI client initialized with evaluator's proxy", flush=True)
-        return client
-    except Exception as exc:
-        print(f"[DEBUG] Client init failed: {exc}", flush=True)
-        return None
 
 
 # ── Fallback Helpers ────────────────────────────────────────────────────────────
@@ -194,7 +163,7 @@ STRICT RULES:
 
 Respond with ONLY JSON: {{"action_type": "ACTION_NAME", "target_id": "TARGET_ID"}}"""
 
-    # ✅ CRITICAL: Attempt LLM call FIRST if client exists (evaluator's proxy)
+    # ✅ CRITICAL: Attempt LLM call FIRST if client exists
     if client is not None:
         try:
             response = client.chat.completions.create(
@@ -348,7 +317,7 @@ def run_task(env: SREEnvironmentClient, client: Optional[OpenAI], task_id: str) 
 
 
 def main():
-    """Main entry point - NEVER crashes on initialization."""
+    """Main entry point."""
     print("=" * 50, flush=True)
     print("SRE DEVOPS ENV — BASELINE INFERENCE", flush=True)
     print("=" * 50, flush=True)
@@ -356,8 +325,19 @@ def main():
     print(f"Model: {MODEL_NAME}", flush=True)
     print(f"Env  : {ENV_URL}", flush=True)
 
-    # ✅ SAFE: Use get_client() which handles missing variables gracefully
-    client = get_client()
+    # ✅ CRITICAL FIX: Create client with evaluator's EXACT credentials
+    # NO modifications, NO cleaning, NO fallbacks - use exactly as injected!
+    client = None
+    if API_BASE_URL and API_KEY:
+        try:
+            client = OpenAI(
+                base_url=API_BASE_URL,  # Use exactly as injected
+                api_key=API_KEY          # Use exactly as injected
+            )
+            print(f"[DEBUG] OpenAI client initialized", flush=True)
+        except Exception as exc:
+            print(f"[DEBUG] Client init failed: {exc}", flush=True)
+            client = None
 
     env = SREEnvironmentClient(ENV_URL)
     health = env.health()
