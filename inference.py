@@ -8,21 +8,32 @@ from openai import OpenAI
 
 # ── HELPER TO GET CONFIG AT RUNTIME ────────────────────────────────────────────
 def get_config():
-    """Load and validate required environment variables at runtime."""
-    api_base_url = os.environ.get("API_BASE_URL")
-    api_key = os.environ.get("API_KEY")
-    model_name = os.environ.get("MODEL_NAME")
-    env_url = os.environ.get("ENV_URL")
+    """Load and validate required environment variables at runtime.
     
-    # Strict validation - all required
+    For Phase 2 submission (with LiteLLM proxy):
+        - API_BASE_URL: LiteLLM proxy endpoint
+        - API_KEY: LiteLLM API key
+        - MODEL_NAME: Model name
+        - ENV_URL: Environment service URL
+    
+    For local testing (with Hugging Face or other providers):
+        - API_BASE_URL: Provider endpoint (e.g., https://router.huggingface.co/v1)
+        - HF_TOKEN or API_KEY: Authentication token
+        - MODEL_NAME: Model name
+        - ENV_URL: Optional, defaults to http://localhost:7860
+    """
+    api_base_url = os.environ.get("API_BASE_URL")
+    api_key = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
+    model_name = os.environ.get("MODEL_NAME")
+    env_url = os.environ.get("ENV_URL", "http://localhost:7860")  # Default for local testing
+    
+    # Strict validation for required variables
     if not api_base_url:
         raise ValueError("ERROR: API_BASE_URL environment variable not set")
     if not api_key:
-        raise ValueError("ERROR: API_KEY environment variable not set")
+        raise ValueError("ERROR: API_KEY (or HF_TOKEN) environment variable not set")
     if not model_name:
         raise ValueError("ERROR: MODEL_NAME environment variable not set")
-    if not env_url:
-        raise ValueError("ERROR: ENV_URL environment variable not set")
     
     return {
         "api_base_url": api_base_url,
@@ -50,18 +61,18 @@ TASK_DEFAULTS = {
     "hard": {"action_type": "InvestigateLog", "target_id": "web-1"},
 }
 
-# ── LOGGING (STRICT FORMAT) ───────────────────────────────────────────────────
-def log_start(task: str, env: str, model: str) -> None:
-    print(f"[START] task={task} env={env} model={model}", flush=True)
+# ── LOGGING (STRICT FORMAT FOR VALIDATOR) ────────────────────────────────────
+def log_start(task: str) -> None:
+    """Print START block in format: [START] task=task_id"""
+    print(f"[START] task={task}", flush=True)
 
-def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
-    error_val = error if error else "null"
-    done_val = str(done).lower()
-    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
+def log_step(step: int, reward: float) -> None:
+    """Print STEP block in format: [STEP] step=N reward=R"""
+    print(f"[STEP] step={step} reward={reward:.2f}", flush=True)
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
+def log_end(task: str, steps: int, score: float) -> None:
+    """Print END block in format: [END] task=task_id score=S steps=N"""
+    print(f"[END] task={task} score={score:.2f} steps={steps}", flush=True)
 
 # ── AI ACTION ─────────────────────────────────────────────────────────────────
 def get_ai_action(client: OpenAI, observation: dict, task_id: str, action_log: List[dict] = None) -> dict:
@@ -114,7 +125,7 @@ def run_task(client: OpenAI, task_id: str) -> float:
     score = 0.0
     success = False
 
-    log_start(task=task_id, env="sre-devops-env", model=CONFIG["model_name"])
+    log_start(task=task_id)
 
     try:
         response = requests.post(
@@ -163,15 +174,16 @@ def run_task(client: OpenAI, task_id: str) -> float:
                 done = True
 
             rewards.append(reward)
-            log_step(step, action_str, reward, done, error_msg)
+            log_step(step, reward)
 
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as e:
-        log_step(steps_taken + 1, "error", 0.0, True, str(e)[:80])
+        # On exception, still ensure we log end with what we have
+        pass
 
     finally:
-        log_end(success, steps_taken, score, rewards)
+        log_end(task_id, steps_taken, score)
 
     return score
 
