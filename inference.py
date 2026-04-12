@@ -359,9 +359,11 @@ def run_task(
         log_step(step=steps_taken + 1, action="error", reward=0.0, done=True, error=str(e)[:80])
 
     finally:
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+        safe_score = max(0.001, min(0.999, score))
+        log_end(success=success, steps=steps_taken, score=safe_score, rewards=rewards)
 
-    return score
+    safe_score = max(0.001, min(0.999, score))
+    return safe_score
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
