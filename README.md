@@ -20,8 +20,6 @@ tags:
 
 [![OpenEnv Compliant](https://img.shields.io/badge/OpenEnv-Compliant-brightgreen.svg)]()
 [![Docker Ready](https://img.shields.io/badge/Docker-Ready-blue.svg)]()
-[![Phase 2 Passed](https://img.shields.io/badge/Phase%202-Passed-brightgreen.svg)]()
-[![LLM](https://img.shields.io/badge/LLM-LiteLLM%20Proxy-orange.svg)]()
 
 **Can AI systems reliably handle real-world production incidents?**
 *This environment finds out.*
