@@ -400,32 +400,29 @@ def main() -> None:
     print("SRE DEVOPS ENV — BASELINE INFERENCE", flush=True)
     print("=" * 50, flush=True)
 
-    # ✅ CRITICAL: ONLY use evaluator's injected credentials - NEVER hardcode your own
+    # ✅ ONLY use evaluator's injected credentials - DO NOT hardcode anything
     api_base_url = os.environ.get("API_BASE_URL", "").strip()
     api_key = os.environ.get("API_KEY", "").strip()
     
     print(f"[DEBUG] API_BASE_URL present: {bool(api_base_url)}", flush=True)
     print(f"[DEBUG] API_KEY present: {bool(api_key)}", flush=True)
-    
-    if api_base_url:
-        print(f"[DEBUG] API_BASE_URL: {api_base_url[:70]}...", flush=True)
 
-    # ✅ Initialize client ONLY with evaluator's LiteLLM proxy credentials
+    # ✅ CRITICAL: Always create client if credentials exist
     client: Optional[OpenAI] = None
     
     if api_base_url and api_key:
         try:
             client = OpenAI(
-                base_url=api_base_url,
-                api_key=api_key
+                base_url=api_base_url,  # Must be THEIR proxy URL
+                api_key=api_key         # Must be THEIR key
             )
-            print(f"[DEBUG] OpenAI client initialized with evaluator's LiteLLM proxy", flush=True)
+            print(f"[DEBUG] Client initialized with evaluator's proxy", flush=True)
         except Exception as exc:
-            print(f"[ERROR] Failed to init client: {exc}", flush=True)
+            print(f"[ERROR] Client init failed: {exc}", flush=True)
             client = None
     else:
-        print(f"[WARNING] Evaluator credentials not found in environment", flush=True)
-        print(f"[WARNING] Will use fallbacks (may fail LLM Criteria Check)", flush=True)
+        # This should NOT happen in their environment
+        print(f"[ERROR] Missing evaluator credentials!", flush=True)
 
     print(f"API  : {api_base_url if api_base_url else 'NOT SET'}", flush=True)
     print(f"Model: {MODEL_NAME}", flush=True)
